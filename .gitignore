@@ -1,0 +1,14 @@
+# Runtime state (state.json, market.json, ads.json, bot.log)
+var/
+
+# Local secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+
+# Tests / coverage
+.pytest_cache/
+.coverage
+htmlcov/

@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "name": "pln",
+  "fiat": "PLN",
+  "strategy": "market_middle",
+  "parser": {
+    "enabled": true,
+    "interval_minutes": 25,
+    "cron": "*/25 * * * *"
+  },
+  "defaults": {
+    "min_amount": "500",
+    "max_amount": "100000",
+    "payment_methods": ["BLIK", "Przelewy24"],
+    "price_offset": "0"
+  },
+  "pairs": [
+    {
+      "pair": "PLN/USDT",
+      "anchor": true,
+      "accounts": ["Binance#1", "Okx#1", "Bybit#1"],
+      "min_amount": "500",
+      "max_amount": "100000",
+      "payment_methods": ["BLIK", "Przelewy24"],
+      "price_offset": "0",
+      "enabled": true
+    },
+    {
+      "pair": "PLN/USDC",
+      "anchor": false,
+      "linked_to": "PLN/USDT",
+      "accounts": ["Binance#1", "Okx#1", "Bybit#1"],
+      "min_amount": "500",
+      "max_amount": "100000",
+      "payment_methods": ["BLIK", "Przelewy24"],
+      "price_offset": "0",
+      "enabled": true
+    }
+  ]
+}
