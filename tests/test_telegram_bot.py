@@ -1,4 +1,4 @@
-"""Poll loop: authorization, replies, offset bookkeeping, backoff, scheduler wiring.
+"""Poll loop: authorization, replies, button presses, offset bookkeeping, backoff.
 
 Every Telegram call is an injected :class:`~tests.conftest.FakeTransport` request, so the
 suite never opens a socket and the assertions read the real request objects.
@@ -13,8 +13,7 @@ from types import SimpleNamespace
 import pytest
 
 from p2pbot.errors import TelegramError, TransportError
-from p2pbot.scheduler import Job, Scheduler
-from p2pbot.telegram.api import Message, TelegramAPI, Update
+from p2pbot.telegram.api import CallbackQuery, Message, TelegramAPI, Update
 from p2pbot.telegram.bot import BotRunner
 from p2pbot.telegram.handlers import HELP_TEXT, HandlerResult
 from p2pbot.telegram.security import AccessController, RateLimiter
@@ -34,7 +33,7 @@ UTC = timezone.utc
 
 
 def _update(
-    text: str = "/version",
+    text: str = "/help",
     *,
     from_id: int = OWNER,
     chat_id: int | None = 42,
@@ -113,8 +112,8 @@ def test_rate_limited_owner_gets_the_fixed_reply(
 
     transport.push_json({"ok": True, "result": {"message_id": 1}})
     transport.push_json({"ok": True, "result": {"message_id": 2}})
-    assert runner.handle_update(_update("/version")) is not None
-    result = runner.handle_update(_update("/version"))
+    assert runner.handle_update(_update("/help")) is not None
+    result = runner.handle_update(_update("/help"))
     assert result is not None
     assert result.text == "Too many requests."
     assert _sent_texts(transport)[-1] == "Too many requests."
@@ -137,7 +136,7 @@ def test_owner_command_is_dispatched_and_replied(
 def test_update_without_a_chat_id_is_not_sent(
     runner: BotRunner, transport: FakeTransport
 ) -> None:
-    result = runner.handle_update(_update("/version", chat_id=None))
+    result = runner.handle_update(_update("/help", chat_id=None))
     assert result is not None
     assert transport.requests == []
 
@@ -146,9 +145,9 @@ def test_a_failing_send_does_not_break_the_loop(
     runner: BotRunner, transport: FakeTransport
 ) -> None:
     transport.push_error(TransportError("connection reset"))
-    result = runner.handle_update(_update("/version"))
+    result = runner.handle_update(_update("/help"))
     assert result is not None
-    assert result.text.startswith("p2pbot ")
+    assert result.text == HELP_TEXT
 
 
 def test_silent_handler_result_is_not_sent(
@@ -158,7 +157,7 @@ def test_silent_handler_result_is_not_sent(
     transport.push_json({"ok": True, "result": {"message_id": 1}})
     runner = BotRunner(stub_services, api)
     monkeypatched = HandlerResult("handled silently", silent=True)
-    assert runner.handle_update(_update("/version")) is not None
+    assert runner.handle_update(_update("/help")) is not None
     assert len(_sent_texts(transport)) == 1
 
     class _SilentDispatcher:
@@ -167,7 +166,7 @@ def test_silent_handler_result_is_not_sent(
 
     runner._dispatcher = _SilentDispatcher()  # noqa: SLF001 - forced silent result
     transport.reset()
-    assert runner.handle_update(_update("/version")) == monkeypatched
+    assert runner.handle_update(_update("/help")) == monkeypatched
     assert transport.requests == []
 
 
@@ -180,9 +179,9 @@ def test_owner_id_is_read_from_the_settings_façade(api: TelegramAPI, transport:
     )
     runner = BotRunner(services, api)
     transport.push_json({"ok": True, "result": {}})
-    assert runner.handle_update(_update("/version", from_id=77)) is not None
+    assert runner.handle_update(_update("/help", from_id=77)) is not None
     transport.reset()
-    assert runner.handle_update(_update("/version", from_id=OWNER)) is None
+    assert runner.handle_update(_update("/help", from_id=OWNER)) is None
     assert transport.requests == []
 
 
@@ -194,7 +193,7 @@ def test_missing_owner_configuration_denies_everyone(api: TelegramAPI, transport
         scheduler=None,
     )
     runner = BotRunner(services, api)
-    assert runner.handle_update(_update("/version")) is None
+    assert runner.handle_update(_update("/help")) is None
     assert transport.requests == []
 
 
@@ -219,57 +218,86 @@ def test_register_commands_failure_is_not_fatal(
     assert "setMyCommands failed" in caplog.text
 
 
-# -- scheduler -------------------------------------------------------------------------
-def test_due_jobs_run_once_per_poll_iteration(
-    stub_services: StubServices, api: TelegramAPI, clock: FakeClock, transport: FakeTransport
+# -- inline buttons --------------------------------------------------------------------
+def _press(data: str, *, from_id: int = OWNER, chat_type: str = "private") -> Update:
+    return Update(
+        update_id=3,
+        callback=CallbackQuery(
+            id="cb-9",
+            from_id=from_id,
+            data=data,
+            message=Message(message_id=55, chat_id=42, chat_type=chat_type, from_id=1),
+        ),
+    )
+
+
+def _calls(transport: FakeTransport) -> list[tuple[str, dict]]:
+    return [(str(request.url).rsplit("/", 1)[-1], request.json_body) for request in transport.requests]
+
+
+def test_setrate_is_sent_with_the_market_buttons(runner: BotRunner, transport: FakeTransport) -> None:
+    transport.push_json({"ok": True, "result": {"message_id": 55}})
+
+    runner.handle_update(_update("/setrate"))
+
+    assert _calls(transport) == [
+        (
+            "sendMessage",
+            {
+                "chat_id": 42,
+                "text": "💱 Set rate · pick a market",
+                "reply_markup": {
+                    "inline_keyboard": [
+                        [
+                            {"text": "🇺🇦 UAH", "callback_data": "setrate:uah"},
+                            {"text": "🇵🇱 PLN", "callback_data": "setrate:pln"},
+                        ]
+                    ]
+                },
+            },
+        )
+    ]
+
+
+def test_a_press_is_answered_the_buttons_removed_and_the_rate_asked(
+    stub_services: StubServices, runner: BotRunner, transport: FakeTransport
 ) -> None:
-    scheduler = Scheduler(clock)
-    calls: list[str] = []
-    scheduler.add(Job.every("parser", lambda: calls.append("parser"), 25))
-    runner = BotRunner(stub_services, api)
-    runner.attach_scheduler(scheduler)
+    for _ in range(3):
+        transport.push_json({"ok": True, "result": True})
 
-    transport.push_json({"ok": True, "result": []})
-    transport.push_json({"ok": True, "result": []})
-    clock.advance(minutes=25)
-    assert runner.run_due_jobs() == 1
-    assert calls == ["parser"]
-    assert runner.run_due_jobs() == 0
+    runner.handle_update(_press("setrate:pln"))
 
-    runner.run_forever(max_iterations=2, sleep=lambda seconds: None)
-    assert len(transport.requests) == 2
+    names = [name for name, _ in _calls(transport)]
+    assert names == ["answerCallbackQuery", "editMessageText", "sendMessage"]
+    calls = dict(_calls(transport))
+    assert calls["answerCallbackQuery"] == {"callback_query_id": "cb-9"}
+    assert calls["editMessageText"] == {"chat_id": 42, "message_id": 55, "text": "💱 Set rate · 🇵🇱 PLN"}
+    assert calls["sendMessage"]["text"].startswith("🇵🇱 Send the PLN rate")
+
+    transport.push_json({"ok": True, "result": {"message_id": 56}})
+    runner.handle_update(_update("3.85"))
+    assert stub_services.setrate_calls[-1]["market"] == "pln"
 
 
-def test_attach_scheduler_replaces_the_previous_one(
-    stub_services: StubServices, api: TelegramAPI, clock: FakeClock
+def test_a_stranger_pressing_a_button_gets_nothing(
+    stub_services: StubServices, runner: BotRunner, transport: FakeTransport
 ) -> None:
-    stub_services.scheduler = Scheduler(clock)
-    runner = BotRunner(stub_services, api)
-    fresh = Scheduler(clock)
-    fresh.add(Job.every("x", lambda: None, 1))
-    runner.attach_scheduler(fresh)
-    clock.advance(minutes=1)
-    assert runner.run_due_jobs() == 1
+    assert runner.handle_update(_press("setrate:uah", from_id=999)) is None
+    assert runner.handle_update(_press("setrate:uah", chat_type="group")) is None
+    assert transport.requests == []
 
 
-def test_run_due_jobs_without_a_scheduler(stub_services: StubServices, api: TelegramAPI) -> None:
-    services = SimpleNamespace(settings=SimpleNamespace(telegram_owner_id=OWNER), scheduler=None)
-    assert BotRunner(services, api).run_due_jobs() == 0
-
-
-def test_a_failing_scheduler_is_logged_and_ignored(
-    stub_services: StubServices, api: TelegramAPI, caplog: pytest.LogCaptureFixture
+def test_a_failing_callback_answer_does_not_stop_the_reply(
+    runner: BotRunner, transport: FakeTransport, caplog: pytest.LogCaptureFixture
 ) -> None:
-    class _Broken:
-        def run_due(self, now: datetime | None = None) -> tuple[()]:
-            raise RuntimeError("scheduler exploded")
-
-    runner = BotRunner(stub_services, api)
-    runner.attach_scheduler(_Broken())
-    with caplog.at_level(logging.ERROR):
-        assert runner.run_due_jobs() == 0
-    assert "scheduler run_due failed" in caplog.text
-    assert "RuntimeError: scheduler exploded" in caplog.text
+    transport.push_error(TransportError("offline"))
+    transport.push_json({"ok": True, "result": True})
+    transport.push_json({"ok": True, "result": True})
+    with caplog.at_level(logging.WARNING):
+        result = runner.handle_update(_press("setrate:uah"))
+    assert result is not None
+    assert "answerCallbackQuery failed" in caplog.text
+    assert _sent_texts(transport)[-1].startswith("🇺🇦 Send the UAH rate")
 
 
 # -- loop ------------------------------------------------------------------------------
@@ -304,7 +332,7 @@ def test_run_forever_handles_updates_inside_the_loop(
                         "message_id": 1,
                         "chat": {"id": 42, "type": "private"},
                         "from": {"id": OWNER},
-                        "text": "/version",
+                        "text": "/help",
                     },
                 }
             ],
@@ -312,7 +340,7 @@ def test_run_forever_handles_updates_inside_the_loop(
     )
     transport.push_json({"ok": True, "result": {"message_id": 9}})
     runner.run_forever(max_iterations=1, sleep=lambda seconds: None)
-    assert _sent_texts(transport) == ["p2pbot 1.0.0, uptime 0s"]
+    assert _sent_texts(transport) == [HELP_TEXT]
 
 
 def test_run_forever_retries_with_exponential_backoff(
@@ -428,7 +456,7 @@ def test_owner_id_that_is_not_a_number_denies_everyone(api: TelegramAPI, transpo
         scheduler=None,
     )
     runner = BotRunner(services, api)
-    assert runner.handle_update(_update("/version")) is None
+    assert runner.handle_update(_update("/help")) is None
     assert transport.requests == []
 
 
@@ -437,5 +465,5 @@ def test_rate_limit_refusal_without_a_chat_id_is_not_sent(
 ) -> None:
     limiter = RateLimiter(max_messages=0, window_seconds=60, clock=MonotonicFakeClock())
     runner = BotRunner(stub_services, api, access=AccessController(OWNER, limiter=limiter))
-    assert runner.handle_update(_update("/version", chat_id=None)) is None
+    assert runner.handle_update(_update("/help", chat_id=None)) is None
     assert transport.requests == []

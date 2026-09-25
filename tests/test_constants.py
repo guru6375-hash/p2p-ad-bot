@@ -30,17 +30,9 @@ SPEC_ATTACHMENT_KEYS = (
 SPEC_COMMANDS = (
     "start",
     "help",
-    "setbase",
-    "setcap",
-    "rates",
-    "scenarios",
-    "scenario",
-    "parse",
-    "publish",
-    "pause",
-    "resume",
-    "status",
-    "version",
+    "setrate",
+    "getads",
+    "cancel",
 )
 
 
@@ -58,16 +50,6 @@ def test_price_ticks_are_decimal_and_cover_both_fiats() -> None:
     assert constants.PRICE_TICK["UAH"] == Decimal("0.01")
     assert constants.PRICE_TICK["PLN"] == Decimal("0.01")
     assert constants.DEFAULT_PRICE_TICK == Decimal("0.01")
-
-
-def test_uah_spread_is_the_hardcoded_per_platform_difference() -> None:
-    """Binance 0.25 UAH, OKX/ByBit 0.01 UAH (verified reference behaviour)."""
-    assert constants.UAH_SPREAD == {
-        "binance": Decimal("0.25"),
-        "okx": Decimal("0.01"),
-        "bybit": Decimal("0.01"),
-    }
-    assert all(type(value) is Decimal for value in constants.UAH_SPREAD.values())
 
 
 def test_parser_interval_default_is_25_minutes() -> None:

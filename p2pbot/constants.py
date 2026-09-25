@@ -1,8 +1,7 @@
 """Hardcoded market/business constants.
 
-Values in this module are *policy*, not configuration: the UAH spreads, the Binance
-advertiser thresholds and the parser interval are fixed by the product requirement. The
-blueprint loader rejects any attempt to override them (see :mod:`p2pbot.blueprint`).
+Values in this module are *policy*, not configuration: the Binance advertiser thresholds
+and the parser interval are fixed by the product requirement.
 """
 
 from __future__ import annotations
@@ -21,14 +20,6 @@ PRICE_TICK: dict[str, Decimal] = {
     "PLN": Decimal("0.01"),
 }
 DEFAULT_PRICE_TICK = Decimal("0.01")
-
-#: HARDCODED minimum difference between the USDT advertisement and the USDC advertisement
-#: for UAH, per platform.  Requirement: Binance 0.25 UAH, ByBit/OKX 0.01 UAH.
-UAH_SPREAD: dict[str, Decimal] = {
-    "binance": Decimal("0.25"),
-    "okx": Decimal("0.01"),
-    "bybit": Decimal("0.01"),
-}
 
 #: HARDCODED competitor-parser cadence for the PLN scenario.
 DEFAULT_PARSER_INTERVAL_MINUTES = 25
@@ -67,17 +58,9 @@ RATE_LIMIT_WINDOW_SECONDS = 60
 TELEGRAM_COMMANDS: tuple[tuple[str, str], ...] = (
     ("start", "usage summary"),
     ("help", "usage summary"),
-    ("setbase", "set base rate: /setbase UAH/USDT 47.00"),
-    ("setcap", "set cap rate: /setcap UAH/USDT 47.10"),
-    ("rates", "show base/cap and computed advertisement prices"),
-    ("scenarios", "list available scenario blueprints"),
-    ("scenario", "activate a scenario: /scenario uah"),
-    ("parse", "run the competitor parser once: /parse [PAIR]"),
-    ("publish", "create/update advertisements now: /publish [--dry]"),
-    ("pause", "deactivate advertisements: /pause [PAIR]"),
-    ("resume", "reactivate advertisements: /resume [PAIR]"),
-    ("status", "scenario, rates, scheduler and last publish results"),
-    ("version", "bot version"),
+    ("setrate", "set the UAH or PLN buy-ad rate (pick with a button)"),
+    ("getads", "your buy ads by account: /getads [PAIR|all] [--offline] [--details]"),
+    ("cancel", "cancel a /setrate that is waiting for a rate"),
 )
 
 #: Telegram message keys that carry an uploaded file or any other binary payload.

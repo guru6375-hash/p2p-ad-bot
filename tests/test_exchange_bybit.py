@@ -24,11 +24,10 @@ from p2pbot.exchanges.bybit import (
     ACTION_ACTIVE,
     ACTION_MODIFY,
     CANCEL_PATH,
-    CREATE_PATH,
     DOCUMENTED_SEARCH_URL,
+    ITEM_INFO_PATH,
     LIST_PATH,
     RECV_WINDOW,
-    REMARK_MAX_LENGTH,
     UPDATE_PATH,
     WEB_SEARCH_URL,
     BybitAdapter,
@@ -476,57 +475,63 @@ def test_list_ads_page_size_is_capped_at_the_venue_maximum(page_size: int, expec
     assert request.json_body["size"] == expected
 
 
-def test_create_ad_request_body_is_built_from_the_spec() -> None:
-    spec = make_spec(
-        price="47.00",
-        min_amount="1000.00",
-        max_amount="9300.00",
-        payment_methods=("PrivatBank (CARD)",),
-    )
+#: The live preferences as item/info answers them: numbers plus undocumented keys.
+LIVE_PREFERENCES = {
+    "completeRateDay30": "",
+    "hasCompleteRateDay30": 0,
+    "isKyc": 1,
+    "registerTimeThreshold": 0,
+    "nationalLimit": "",
+    "hasSingleUserOrderLimit": 0,
+    "singleUserOrderLimit": 0,
+}
+#: ...and as item/update accepts them: documented keys only, every value a string.
+SENT_PREFERENCES = {
+    "completeRateDay30": "",
+    "hasCompleteRateDay30": "0",
+    "isKyc": "1",
+    "registerTimeThreshold": "0",
+    "nationalLimit": "",
+}
 
-    request = make_bybit().build_create_ad_request(ACCOUNT, spec)
 
-    assert request.url == f"https://api.bybit.com{CREATE_PATH}"
-    assert request.json_body == {
-        "tokenId": "USDT",
-        "currencyId": "UAH",
-        "side": "1",
-        "priceType": "0",
-        "premium": "0",
-        "price": "47.00",
-        "minAmount": "1000.00",
-        "maxAmount": "9300.00",
-        "remark": "UAH/USDT | PrivatBank (CARD)",
-        "tradingPreferenceSet": {},
-        "paymentIds": ["-1"],  # the documented sample value when the caller supplies none
-        "quantity": "197",  # floor(9300.00 / 47.00)
-        "paymentPeriod": "15",
-        "itemType": "ORIGIN",
+def item_info(**fields: Any) -> Any:
+    """An ``item/info`` answer carrying the fields an update echoes."""
+    item = {
+        "id": "1899658238346616832",
+        "remark": "1 платіж, без комісії.",
+        "tradingPreferenceSet": dict(LIVE_PREFERENCES),
+        "paymentPeriod": 30,
+        "quantity": "112085.6784",
+        "payments": ["43", "22"],
+        "paymentTerms": [{"id": "2366358", "paymentType": 43}, {"id": "2782816", "paymentType": 22}],
     }
-    assert_bybit_signature(request)
+    item.update(fields)
+    return json_response({"ret_code": 0, "ret_msg": "SUCCESS", "result": item})
 
 
-def test_create_ad_request_uses_explicit_quantity_and_payment_ids() -> None:
-    spec = make_spec(
-        side=SIDE_BUY,
-        quantity="10000",
-        payment_ids=("14", "377"),
-        payment_methods=("BLIK",),
-    )
+def test_update_ad_request_uses_explicit_quantity_and_payment_ids() -> None:
+    spec = make_spec(quantity="10000", payment_ids=("14", "377"), payment_methods=("BLIK",))
 
-    body = make_bybit().build_create_ad_request(ACCOUNT, spec).json_body
+    body = make_bybit(item_info()).build_update_ad_request(ACCOUNT, spec, "1").json_body
 
-    assert body["side"] == "0"
     assert body["quantity"] == "10000"
     assert body["paymentIds"] == ["14", "377"]
-    assert body["remark"] == "UAH/USDT | BLIK"
 
 
-def test_create_ad_request_refuses_more_payment_ids_than_the_venue_accepts() -> None:
+def test_update_ad_request_derives_the_quantity_from_max_amount_over_price() -> None:
+    spec = make_spec(price="47.00", max_amount="9300.00", quantity=None)
+
+    body = make_bybit(item_info()).build_update_ad_request(ACCOUNT, spec, "1").json_body
+
+    assert body["quantity"] == "197"  # floor(9300.00 / 47.00)
+
+
+def test_update_ad_request_refuses_more_payment_ids_than_the_venue_accepts() -> None:
     spec = make_spec(payment_ids=tuple(str(index) for index in range(6)))
 
     with pytest.raises(ConfigError) as excinfo:
-        make_bybit().build_create_ad_request(ACCOUNT, spec)
+        make_bybit(item_info()).build_update_ad_request(ACCOUNT, spec, "1")
 
     assert str(excinfo.value) == "bybit accepts at most 5 payment ids, got 6"
 
@@ -544,28 +549,26 @@ def test_create_ad_request_refuses_more_payment_ids_than_the_venue_accepts() -> 
         ),
     ],
 )
-def test_create_ad_request_refuses_an_unusable_quantity(spec_kwargs: dict[str, Any], message: str) -> None:
+def test_update_ad_request_refuses_an_unusable_quantity(spec_kwargs: dict[str, Any], message: str) -> None:
     with pytest.raises(ConfigError) as excinfo:
-        make_bybit().build_create_ad_request(ACCOUNT, make_spec(**spec_kwargs))
+        make_bybit(item_info()).build_update_ad_request(ACCOUNT, make_spec(**spec_kwargs), "1")
 
     assert str(excinfo.value) == message
 
 
-def test_create_ad_request_rejects_an_unknown_side() -> None:
-    with pytest.raises(ConfigError) as excinfo:
-        make_bybit().build_create_ad_request(ACCOUNT, make_spec(side="both"))
-
-    assert str(excinfo.value) == "unknown side 'both'; expected 'sell' or 'buy'"
-
-
-def test_update_ad_request_modifies_the_ad_and_can_relist_it() -> None:
+def test_update_ad_request_echoes_the_live_remark_preferences_and_payment_period() -> None:
     spec = make_spec(price="47.25", min_amount="900", max_amount="44000", quantity="2")
+    adapter = make_bybit(item_info(), item_info())
 
-    modify = make_bybit().build_update_ad_request(ACCOUNT, spec, "1899658238346616832")
-    relist = make_bybit().build_update_ad_request(
+    modify = adapter.build_update_ad_request(ACCOUNT, spec, "1899658238346616832")
+    relist = adapter.build_update_ad_request(
         ACCOUNT, spec, "1899658238346616832", action_type="active"
     )
 
+    info_request = adapter.transport.requests[0]
+    assert info_request.url == f"https://api.bybit.com{ITEM_INFO_PATH}"
+    assert info_request.json_body == {"itemId": "1899658238346616832"}
+    assert_bybit_signature(info_request)
     assert modify.url == f"https://api.bybit.com{UPDATE_PATH}"
     assert modify.json_body == {
         "id": "1899658238346616832",
@@ -575,15 +578,77 @@ def test_update_ad_request_modifies_the_ad_and_can_relist_it() -> None:
         "price": "47.25",
         "minAmount": "900",
         "maxAmount": "44000",
-        "remark": "UAH/USDT",
-        "tradingPreferenceSet": {},
-        "paymentIds": ["-1"],
+        "remark": "1 платіж, без комісії.",  # the ad's own text, never replaced
+        "tradingPreferenceSet": SENT_PREFERENCES,  # same requirements, update-schema shape
+        "paymentIds": ["2366358", "2782816"],  # the ad's own payment methods, not type ids
         "quantity": "2",
-        "paymentPeriod": "15",
+        "paymentPeriod": "30",  # the ad's own period, not a default
     }
     assert relist.json_body["actionType"] == ACTION_ACTIVE
     assert_bybit_signature(modify)
     assert_bybit_signature(relist)
+
+
+def test_update_refuses_to_drop_an_undocumented_preference_that_is_set() -> None:
+    prefs = dict(LIVE_PREFERENCES, singleUserOrderLimit=3)
+    adapter = make_bybit(item_info(tradingPreferenceSet=prefs))
+
+    with pytest.raises(ConfigError, match="singleUserOrderLimit=3, which item/update cannot carry"):
+        adapter.build_update_ad_request(ACCOUNT, make_spec(quantity="1"), "1")
+
+
+@pytest.mark.parametrize("terms", [None, [], [{"id": ""}]])
+def test_update_refuses_an_ad_that_reports_no_payment_methods(terms: Any) -> None:
+    adapter = make_bybit(item_info(paymentTerms=terms))
+
+    with pytest.raises(ApiError, match="reports no payment methods .paymentTerms.; refusing to replace them"):
+        adapter.build_update_ad_request(ACCOUNT, make_spec(quantity="1"), "1")
+
+
+def test_update_refuses_more_live_payment_methods_than_the_venue_accepts() -> None:
+    terms = [{"id": str(index)} for index in range(6)]
+
+    with pytest.raises(ConfigError, match="at most 5 payment ids, got 6"):
+        make_bybit(item_info(paymentTerms=terms)).build_update_ad_request(ACCOUNT, make_spec(quantity="1"), "1")
+
+
+def test_update_keeps_an_empty_remark_empty() -> None:
+    body = make_bybit(item_info(remark="")).build_update_ad_request(ACCOUNT, make_spec(quantity="1"), "1").json_body
+
+    assert body["remark"] == ""
+
+
+@pytest.mark.parametrize(
+    ("fields", "missing"),
+    [
+        ({"remark": None}, "remark"),
+        ({"tradingPreferenceSet": None}, "tradingPreferenceSet"),
+        ({"tradingPreferenceSet": "none"}, "tradingPreferenceSet"),
+        ({"paymentPeriod": None}, "paymentPeriod"),
+    ],
+)
+def test_update_refuses_to_overwrite_a_field_the_live_ad_does_not_report(
+    fields: dict[str, Any], missing: str
+) -> None:
+    adapter = make_bybit(item_info(**fields))
+
+    with pytest.raises(ApiError) as excinfo:
+        adapter.build_update_ad_request(ACCOUNT, make_spec(quantity="1"), "1")
+
+    assert f"lacks {missing}; refusing to overwrite them with defaults" in str(excinfo.value)
+    assert len(adapter.transport) == 1  # only item/info: no update is built
+
+
+@pytest.mark.parametrize(
+    ("payload", "error"),
+    [
+        ({"ret_code": 0, "ret_msg": "SUCCESS", "result": None}, "has no detail object"),
+        ({"ret_code": 10001, "ret_msg": "item not found"}, "item not found"),
+    ],
+)
+def test_update_reports_an_unreadable_live_ad(payload: Any, error: str) -> None:
+    with pytest.raises(ApiError, match=error):
+        make_bybit(json_response(payload)).build_update_ad_request(ACCOUNT, make_spec(quantity="1"), "1")
 
 
 def test_update_ad_request_rejects_an_unknown_action() -> None:
@@ -638,17 +703,6 @@ def test_timestamp_is_milliseconds_from_the_injected_clock_in_utc() -> None:
     assert naive.timestamp_ms() == str(FIXED_NOW_MS)
 
 
-def test_remark_is_derived_deterministically_and_truncated() -> None:
-    adapter = make_bybit()
-
-    assert adapter.build_remark(make_spec()) == "UAH/USDT"
-    long_method = "X" * 2000
-    remark = adapter.build_remark(make_spec(payment_methods=(long_method,)))
-
-    assert len(remark) == REMARK_MAX_LENGTH
-    assert remark.startswith("UAH/USDT | XXX")
-
-
 # --------------------------------------------------------------------------------------
 # private responses
 # --------------------------------------------------------------------------------------
@@ -657,8 +711,7 @@ def test_parse_ad_response_reads_result_item_id_only() -> None:
 
     assert result.adv_no == "1899658238346616832"
     assert result.platform == "bybit"
-    assert result.price is None  # create/update/cancel echo no price
-    assert result.created is False
+    assert result.price is None  # update/cancel echo no price
     assert result.account_id == ""
     assert result.pair == Pair.parse("XXX/XXX")
     assert result.raw == {"ret_code": 0, "ret_msg": "SUCCESS", "result": {"itemId": "1899658238346616832"}}
@@ -690,26 +743,24 @@ def test_parse_ad_response_keeps_a_non_object_payload_as_an_empty_raw() -> None:
 def test_parse_ad_result_bridges_the_response_into_the_identity_fields() -> None:
     adapter = make_bybit()
 
-    created = adapter.parse_ad_result(
+    echoed = adapter.parse_ad_result(
         {"ret_code": 0, "ret_msg": "SUCCESS", "result": {"itemId": "1899658238346616832"}},
         account=ACCOUNT,
         pair=UAH_USDT,
         spec=make_spec(price="47.00"),
-        created=True,
     )
-    updated = adapter.parse_ad_result(
+    addressed = adapter.parse_ad_result(
         {"ret_code": 0, "ret_msg": "SUCCESS"},
         account=ACCOUNT,
         pair=UAH_USDT,
         spec=make_spec(price="47.25"),
-        created=False,
         adv_no="1899658238346616832",
     )
 
-    assert (created.adv_no, created.price, created.created) == ("1899658238346616832", Decimal("47.00"), True)
-    assert created.account_id == "Bybit#1"
-    assert created.pair is UAH_USDT
-    assert (updated.adv_no, updated.price, updated.created) == ("1899658238346616832", Decimal("47.25"), False)
+    assert (echoed.adv_no, echoed.price) == ("1899658238346616832", Decimal("47.00"))
+    assert echoed.account_id == "Bybit#1"
+    assert echoed.pair is UAH_USDT
+    assert (addressed.adv_no, addressed.price) == ("1899658238346616832", Decimal("47.25"))
 
 
 @pytest.mark.parametrize(
@@ -754,3 +805,106 @@ def test_send_private_surfaces_an_http_failure() -> None:
 
     assert excinfo.value.status == 503
     assert "bybit request for account Bybit#1 failed with HTTP 503" in str(excinfo.value)
+
+
+# -- every own advertisement -----------------------------------------------------------
+def _own_item(item_id: str, **fields: Any) -> dict[str, Any]:
+    item = {
+        "id": item_id,
+        "tokenId": "USDT",
+        "currencyId": "UAH",
+        "side": 1,
+        "price": "47.00",
+        "lastQuantity": "250.5",
+        "minAmount": "1000",
+        "maxAmount": "200000",
+        "status": 10,
+        "payments": ["7110", "", None],
+        "paymentTerms": [{"id": "2366358", "paymentType": 7110}, {"id": ""}, "junk"],
+    }
+    item.update(fields)
+    return item
+
+
+def _own_page(*items: dict[str, Any]) -> Any:
+    return json_response(
+        {"ret_code": 0, "ret_msg": "SUCCESS", "result": {"count": len(items), "items": list(items)}}
+    )
+
+
+def test_own_ads_request_lists_every_pair_and_status() -> None:
+    request = make_bybit().build_own_ads_request(ACCOUNT, page=2)
+
+    assert request.url == f"https://api.bybit.com{LIST_PATH}"
+    assert request.json_body == {"page": "2", "size": "30"}
+    assert_bybit_signature(request)
+
+
+def test_own_ads_page_size_is_capped_at_the_venue_maximum() -> None:
+    request = make_bybit(own_ads_page_size=100).build_own_ads_request(ACCOUNT, page=1)
+
+    assert request.json_body["size"] == "30"
+
+
+def test_fetch_own_ads_normalizes_online_offline_and_completed_ads() -> None:
+    adapter = make_bybit(
+        _own_page(
+            _own_item("1"),
+            _own_item("2", status=20, side=0, tokenId="USDC", currencyId="PLN", price="bad"),
+            _own_item("3", status=30),
+            _own_item("4", status=99),
+            _own_item("", status=10),
+            _own_item("5", tokenId=None),
+        ),
+        _own_page(),
+    )
+
+    ads = adapter.fetch_own_ads(ACCOUNT)
+
+    assert [(ad.adv_no, ad.pair.symbol, ad.side, ad.status) for ad in ads] == [
+        ("1", "UAH/USDT", SIDE_SELL, "online"),
+        ("2", "PLN/USDC", SIDE_BUY, "offline"),
+        ("3", "UAH/USDT", SIDE_SELL, "closed"),
+        ("4", "UAH/USDT", SIDE_SELL, "unknown"),
+    ]
+    first = ads[0]
+    assert first.account_id == "Bybit#1"
+    assert first.price == Decimal("47.00")
+    assert first.quantity == Decimal("250.5")
+    assert (first.min_amount, first.max_amount) == (Decimal("1000"), Decimal("200000"))
+    assert first.payment_methods == ("7110",)
+    assert first.venue_status == "10"
+    assert ads[1].price is None
+
+
+def test_fetch_own_ads_follows_full_pages() -> None:
+    full = [_own_item(str(index)) for index in range(30)]
+    adapter = make_bybit(_own_page(*full), _own_page(_own_item("30")))
+
+    ads = adapter.fetch_own_ads(ACCOUNT)
+
+    assert len(ads) == 31
+    assert [request.json_body["page"] for request in adapter.transport.requests] == ["1", "2"]
+
+
+def test_parse_own_ad_reports_the_total_quantity_payment_ids_and_a_floating_premium() -> None:
+    adapter = make_bybit()
+
+    fixed = adapter.parse_own_ad(
+        _own_item("1", quantity="300", lastQuantity="120", priceType=0, premium=""), ACCOUNT
+    )
+    floating = adapter.parse_own_ad(_own_item("2", priceType=1, premium="101.5"), ACCOUNT)
+
+    # the update sends the amount left on the ad, never the listing's total
+    assert fixed.total_quantity == Decimal("120")
+    assert fixed.payment_methods == ("7110",)  # payment *type* ids, for display
+    assert fixed.payment_ids == ("2366358",)  # the account's own ids, what an update needs
+    assert fixed.price_floating_ratio is None
+    assert floating.price_floating_ratio == Decimal("101.5")
+
+
+def test_update_ad_request_refuses_a_floating_ratio() -> None:
+    spec = make_spec(quantity="1", price_floating_ratio="91")
+
+    with pytest.raises(ConfigError, match="bybit: floating-price updates are not supported"):
+        make_bybit().build_update_ad_request(ACCOUNT, spec, "1")

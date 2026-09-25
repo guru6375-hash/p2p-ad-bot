@@ -21,10 +21,9 @@ applies.  Amounts, payment methods and the remaining fields are preserved verbat
 
 Private advertisement management (API-key, merchant gated)
 ----------------------------------------------------------
-Paths (research-verified: ``GET`` on the two write paths answers ``405``, i.e. they are
-POST-only routes) against ``https://www.okx.com``:
+Paths (research-verified: ``GET`` on the update path answers ``405``, i.e. it is a
+POST-only route) against ``https://www.okx.com``:
 
-* create -> ``POST /api/v5/p2p/ad/create``
 * update -> ``POST /api/v5/p2p/ad/update``
 * list own ads -> ``POST /api/v5/p2p/ad/list``
 
@@ -44,14 +43,15 @@ public reference for it, so the *shape* of the private requests could not be ver
 merchant credentials exist on this box, and the API-guide page truncates before the P2P
 sections.  What is unverified, and where it is centralized:
 
-* wire names of the body fields -> :data:`AD_BODY_FIELDS` / :data:`CREATE_AD_FIELDS` /
+* wire names of the body fields -> :data:`AD_BODY_FIELDS` /
   :data:`UPDATE_AD_FIELDS` / :data:`LIST_ADS_FIELDS`;
-* the own-ad listing path and its pagination/target fields -> :data:`LIST_ADS_PATH` and
-  ``LIST_ADS_FIELDS``;
+* the own-ad listing path and its pagination/target fields -> :data:`LIST_ADS_PATH`,
+  ``LIST_ADS_FIELDS`` and ``OWN_ADS_FIELDS``; a listed ad's state values ->
+  :data:`OWN_AD_STATUSES`;
 * the field carrying the on/off state and its two values -> ``*_AD_FIELDS["status"]`` and
   :data:`AD_STATUS_VALUES`;
 * the field naming an existing advertisement in an update -> ``UPDATE_AD_FIELDS["adv_no"]``;
-* the id key echoed by create/update responses -> :data:`AD_ID_RESPONSE_FIELDS`;
+* the id key echoed by update responses -> :data:`AD_ID_RESPONSE_FIELDS`;
 * the per-asset quantity precision used by the derived quantity -> :data:`QUANTITY_STEP`.
 
 Everything else (paths, envelope handling, signing, normalization) follows verified
@@ -73,22 +73,33 @@ from datetime import datetime, timezone
 from decimal import ROUND_DOWN, Decimal
 from typing import Any, ClassVar, Mapping
 
-from ..constants import SIDE_SELL
+from ..constants import SIDE_BUY, SIDE_SELL
 from ..errors import ApiError, ConfigError
-from ..models import Account, AdActionResult, AdSpec, CompetitorAd, Pair, parse_decimal
+from ..models import (
+    AD_STATUS_OFFLINE,
+    AD_STATUS_ONLINE,
+    AD_STATUS_UNKNOWN,
+    Account,
+    AdActionResult,
+    AdSpec,
+    CompetitorAd,
+    OwnAd,
+    Pair,
+    parse_decimal,
+)
 from .base import ExchangeAdapter, HttpRequest
 
 __all__ = [
     "OkxAdapter",
     "BASE_URL",
     "SEARCH_PATH",
-    "CREATE_AD_PATH",
     "UPDATE_AD_PATH",
     "LIST_ADS_PATH",
     "AD_BODY_FIELDS",
-    "CREATE_AD_FIELDS",
     "UPDATE_AD_FIELDS",
     "LIST_ADS_FIELDS",
+    "OWN_ADS_FIELDS",
+    "OWN_AD_STATUSES",
     "AD_ID_RESPONSE_FIELDS",
     "AD_STATUS_VALUES",
     "QUANTITY_STEP",
@@ -102,12 +113,11 @@ BASE_URL = "https://www.okx.com"
 #: Public competitor search (live-verified, unauthenticated).
 SEARCH_PATH = "/v3/c2c/tradingOrders/getMarketplaceAdsPrelogin"
 
-#: Private write paths (live-verified to exist: ``GET`` answers ``405``).
-CREATE_AD_PATH = "/api/v5/p2p/ad/create"
+#: Private write path (live-verified to exist: ``GET`` answers ``405``).
 UPDATE_AD_PATH = "/api/v5/p2p/ad/update"
 #: UNCONFIRMED path: every other candidate (``ad/list``, ``ad/my-ads``, ``ad/query-ads``,
-#: …) answered ``404``; ``ad/list`` is the closest name to the documented ``ad/create`` /
-#: ``ad/update`` siblings and is the target for the account's own advertisements.
+#: …) answered ``404``; ``ad/list`` is the closest name to the documented ``ad/update``
+#: sibling and is the target for the account's own advertisements.
 LIST_ADS_PATH = "/api/v5/p2p/ad/list"
 
 #: Envelope arrays of the public search; the requested side is populated, the other is empty.
@@ -147,22 +157,6 @@ AD_BODY_FIELDS: dict[str, str] = {
     "number_per_page": "numberPerPage",  # UNCONFIRMED
 }
 
-#: Fields published by ``POST /api/v5/p2p/ad/create`` (wire names from AD_BODY_FIELDS).
-CREATE_AD_FIELDS: dict[str, str] = {
-    key: AD_BODY_FIELDS[key]
-    for key in (
-        "crypto",
-        "fiat",
-        "side",
-        "price",
-        "min_amount",
-        "max_amount",
-        "quantity",
-        "payment_methods",
-        "status",
-    )
-}
-
 #: Fields published by ``POST /api/v5/p2p/ad/update`` (the address plus the same payload).
 UPDATE_AD_FIELDS: dict[str, str] = {
     key: AD_BODY_FIELDS[key]
@@ -186,7 +180,20 @@ LIST_ADS_FIELDS: dict[str, str] = {
     for key in ("crypto", "fiat", "side", "current_page", "number_per_page")
 }
 
-#: Keys a create/update response may use to report the advertisement id.  UNCONFIRMED.
+#: Body of the every-own-ad listing: pagination only, so no pair or side narrows it
+#: (UNCONFIRMED names, see AD_BODY_FIELDS).
+OWN_ADS_FIELDS: dict[str, str] = {
+    key: AD_BODY_FIELDS[key] for key in ("current_page", "number_per_page")
+}
+
+#: A listed ad's state value -> :class:`~p2pbot.models.OwnAd` status; the inverse of
+#: :data:`AD_STATUS_VALUES` (UNCONFIRMED values, like the ones we send).
+OWN_AD_STATUSES: dict[str, str] = {
+    AD_STATUS_VALUES[True]: AD_STATUS_ONLINE,
+    AD_STATUS_VALUES[False]: AD_STATUS_OFFLINE,
+}
+
+#: Keys an update response may use to report the advertisement id.  UNCONFIRMED.
 AD_ID_RESPONSE_FIELDS: tuple[str, ...] = ("adId", "advNo", "id")
 
 #: Identity placeholders of a bare :meth:`OkxAdapter.parse_ad_response` result; the real
@@ -295,7 +302,7 @@ def _first_record(payload: Any) -> dict[str, Any]:
 class OkxAdapter(ExchangeAdapter):
     """Adapter for OKX P2P (``platform = "okx"``).
 
-    The public competitor search is unauthenticated; the private create/update/list calls
+    The public competitor search is unauthenticated; the private update/list calls
     sign with the account's ``API_KEY`` / ``SECRET_KEY`` / ``PASSPHRASE`` (never logged) and
     need no session bootstrap, so :meth:`build_login_request` returns ``None``.
     """
@@ -388,17 +395,51 @@ class OkxAdapter(ExchangeAdapter):
         }
         return self._signed_post(account, LIST_ADS_PATH, body)
 
-    def build_create_ad_request(
-        self, account: Account, spec: AdSpec, adv_no: str | None = None
-    ) -> HttpRequest:
-        """Publish ``spec`` as a new advertisement.
+    def build_own_ads_request(self, account: Account, *, page: int) -> HttpRequest:
+        """One page of every own advertisement (path and names UNCONFIRMED, see above)."""
+        body: dict[str, Any] = {
+            OWN_ADS_FIELDS["current_page"]: int(page),
+            OWN_ADS_FIELDS["number_per_page"]: self.own_ads_page_size,
+        }
+        return self._signed_post(account, LIST_ADS_PATH, body)
 
-        ``adv_no`` is accepted for interface compatibility and ignored: a create always
-        allocates a fresh advertisement id.  ``AdSpec.active`` travels in the body's status
-        field (a disabled spec creates the ad in its off state), which for the publisher's
-        create path is ``True``.
-        """
-        return self._signed_post(account, CREATE_AD_PATH, self._ad_body(spec, CREATE_AD_FIELDS))
+    def parse_own_ad(self, row: Mapping[str, Any], account: Account) -> OwnAd | None:
+        """Normalize one own-ad row, read with the :data:`AD_BODY_FIELDS` wire names."""
+        adv_no = _first_text(row, AD_ID_RESPONSE_FIELDS)
+        try:
+            pair = Pair(
+                fiat=_first_text(row, (AD_BODY_FIELDS["fiat"],)) or "",
+                crypto=_first_text(row, (AD_BODY_FIELDS["crypto"],)) or "",
+            )
+        except ConfigError:
+            pair = None
+        if adv_no is None or pair is None:
+            _log.debug("okx %s: skipped an own-ad row without id/currencies", account.id)
+            return None
+        side = str(row.get(AD_BODY_FIELDS["side"]) or "").strip().lower()
+        venue_status = str(row.get(AD_BODY_FIELDS["status"]) or "").strip()
+        methods = row.get(AD_BODY_FIELDS["payment_methods"])
+        payments = tuple(
+            str(method).strip()
+            for method in (methods if isinstance(methods, (list, tuple)) else ())
+            if isinstance(method, str) and method.strip()
+        )
+        return OwnAd(
+            platform=self.platform,
+            account_id=account.id,
+            adv_no=adv_no,
+            pair=pair,
+            side=side if side in (SIDE_SELL, SIDE_BUY) else "",
+            status=OWN_AD_STATUSES.get(venue_status.lower(), AD_STATUS_UNKNOWN),
+            price=_optional_decimal(row.get(AD_BODY_FIELDS["price"])),
+            min_amount=_optional_decimal(row.get(AD_BODY_FIELDS["min_amount"])),
+            max_amount=_optional_decimal(row.get(AD_BODY_FIELDS["max_amount"])),
+            quantity=_optional_decimal(row.get(AD_BODY_FIELDS["quantity"])),
+            payment_methods=payments,
+            venue_status=venue_status,
+            total_quantity=_optional_decimal(row.get(AD_BODY_FIELDS["quantity"])),
+            payment_ids=payments,
+        )
 
     def build_update_ad_request(self, account: Account, spec: AdSpec, adv_no: str) -> HttpRequest:
         """Update the advertisement ``adv_no`` to ``spec`` (including its on/off state)."""
@@ -407,9 +448,9 @@ class OkxAdapter(ExchangeAdapter):
         return self._signed_post(account, UPDATE_AD_PATH, body)
 
     def parse_ad_response(self, payload: Any) -> AdActionResult:
-        """Read only what the create/update payload says (advertisement id, echoed price).
+        """Read only what the update payload says (advertisement id, echoed price).
 
-        Identity fields (platform/account/pair/created) stay placeholders; the inherited
+        Identity fields (platform/account/pair) stay placeholders; the inherited
         :meth:`ExchangeAdapter.parse_ad_result` completes them from the request context.
         """
         record = _first_record(payload)
@@ -421,7 +462,6 @@ class OkxAdapter(ExchangeAdapter):
             # ``None`` when the venue does not echo a price: parse_ad_result then uses the
             # spec's price.  AdActionResult.price is not Optional, hence the cast comment.
             price=_optional_decimal(record.get("price")),  # type: ignore[arg-type]
-            created=False,
             raw=record,
         )
 
@@ -460,7 +500,9 @@ class OkxAdapter(ExchangeAdapter):
         )
 
     def _ad_body(self, spec: AdSpec, fields: Mapping[str, str]) -> dict[str, Any]:
-        """The create/update payload of ``spec`` using this request's wire names."""
+        """The update payload of ``spec`` using this request's wire names."""
+        if spec.price_floating_ratio is not None:
+            raise ConfigError("okx: floating-price updates are not supported; pass a fixed price")
         quantity = spec.quantity if spec.quantity is not None else _default_quantity(spec)
         return {
             fields["crypto"]: spec.pair.crypto,

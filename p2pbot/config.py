@@ -165,7 +165,7 @@ class Settings:
 
     ``raw`` is the *complete* merged mapping (process environment overlaid on the ``.env``
     file) with uppercase keys, so optional switches the loader does not interpret itself
-    (``SCENARIO``, ``REFRESH_INTERVAL_MINUTES``, …) stay reachable. :meth:`redacted` masks
+    (``SCENARIO``, …) stay reachable. :meth:`redacted` masks
     the credential-shaped entries of it.
     """
 
@@ -180,6 +180,26 @@ class Settings:
     log_level: str
     accounts: Mapping[str, Account]
     raw: Mapping[str, str]
+
+    @property
+    def disabled_platforms(self) -> frozenset[str]:
+        """Exchanges switched off with ``DISABLED_EXCHANGES`` (comma-separated, e.g. ``okx``).
+
+        Their accounts stay configured but are never read or edited. An unknown name raises
+        :class:`ConfigError`.
+        """
+        names = {
+            name.strip().lower()
+            for name in self.raw.get("DISABLED_EXCHANGES", "").split(",")
+            if name.strip()
+        }
+        unknown = sorted(names - set(PLATFORMS))
+        if unknown:
+            raise ConfigError(
+                f"DISABLED_EXCHANGES has unknown exchange(s) {', '.join(unknown)}; "
+                f"known: {', '.join(PLATFORMS)}"
+            )
+        return frozenset(names)
 
     def account(self, account_id: str) -> Account:
         """The account with this id, e.g. ``"Binance#1"``."""

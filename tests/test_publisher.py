@@ -1,4 +1,4 @@
-"""Publisher: cap re-assertion, create/update, dry-run, ledger persistence (SPEC 10)."""
+"""Publisher: the ad ledger, buy-ad edits (``edit_ad``) and the live ad listing."""
 
 from __future__ import annotations
 
@@ -9,12 +9,10 @@ from pathlib import Path
 
 import pytest
 
-from p2pbot.blueprint import parse_blueprint
-from p2pbot.constants import SIDE_SELL
+from p2pbot.constants import SIDE_BUY
 from p2pbot.errors import BotError, ConfigError, TransportError
-from p2pbot.models import AdActionResult, AdRecord, AdSpec, ComputedAd, Pair, PublishResult
-from p2pbot.publisher import AdPublisher, AdStore, build_ad_spec
-from p2pbot.rates import RateStore
+from p2pbot.models import AdActionResult, AdRecord, AdSpec, OwnAd, Pair
+from p2pbot.publisher import AdPublisher, AdStore
 
 UAH_USDT = Pair.parse("UAH/USDT")
 UAH_USDC = Pair.parse("UAH/USDC")
@@ -31,13 +29,18 @@ class _FakeAdapter:
         error: BaseException | None = None,
         login_request: object | None = None,
         login_error: BaseException | None = None,
+        own_ads: tuple[OwnAd, ...] = (),
+        list_error: BaseException | None = None,
     ) -> None:
         self.platform = platform
+        self.own_ads = own_ads
+        self.list_error = list_error
         self.adv_no = adv_no
         self.error = error
         self.login_request = login_request
         self.login_error = login_error
         self.built: list[tuple[str, str, Decimal, bool]] = []
+        self.specs: list[AdSpec] = []
         self.sent: list[tuple[str, object]] = []
         self.logins: list[str] = []
 
@@ -46,13 +49,15 @@ class _FakeAdapter:
         self.logins.append(account.id)
         return self.login_request
 
-    def build_create_ad_request(self, account, spec, adv_no=None):
-        self.built.append(("create", account.id, spec.price, spec.active))
-        return f"create:{account.id}"
-
     def build_update_ad_request(self, account, spec, adv_no):
         self.built.append(("update", account.id, spec.price, spec.active))
+        self.specs.append(spec)
         return f"update:{account.id}:{adv_no}"
+
+    def fetch_own_ads(self, account):
+        if self.list_error is not None:
+            raise self.list_error
+        return tuple(ad for ad in self.own_ads if ad.account_id == account.id)
 
     # -- execution hooks -------------------------------------------------------------
     def send_private(self, account, request):
@@ -63,34 +68,15 @@ class _FakeAdapter:
             raise self.error
         return {"raw": True}
 
-    def parse_ad_result(self, payload, *, account, pair, spec, created):
+    def parse_ad_result(self, payload, *, account, pair, spec):
         return AdActionResult(
             platform=self.platform,
             account_id=account.id,
             pair=pair,
             adv_no=self.adv_no,
             price=spec.price,
-            created=created,
             raw=payload,
         )
-
-
-def _computed(
-    *,
-    pair: str = "UAH/USDT",
-    platform: str = "binance",
-    price: str = "47.00",
-    cap: str = "47.20",
-    accounts: tuple[str, ...] = ("Binance#1",),
-) -> ComputedAd:
-    return ComputedAd(
-        pair=Pair.parse(pair),
-        platform=platform,
-        price=Decimal(price),
-        source="base_rate",
-        cap=Decimal(cap),
-        accounts=accounts,
-    )
 
 
 def _publisher(
@@ -98,365 +84,12 @@ def _publisher(
     *,
     adapters=None,
     store=None,
-    rates=None,
     dry_run=False,
-    plans=None,
-) -> tuple[AdPublisher, dict[str, _FakeAdapter], AdStore, RateStore]:
+) -> tuple[AdPublisher, dict[str, _FakeAdapter], AdStore]:
     resolved = adapters if adapters is not None else {"binance": _FakeAdapter("binance")}
     ad_store = store if store is not None else AdStore()
-    rate_store = rates if rates is not None else RateStore()
-    publisher = AdPublisher(resolved, settings, ad_store, rate_store, dry_run, plans=plans)
-    return publisher, resolved, ad_store, rate_store
-
-
-# -- cap re-assertion ------------------------------------------------------------------
-def test_cap_is_re_asserted_before_the_request_is_built(settings) -> None:
-    rates = RateStore()
-    rates.set_cap("UAH/USDT", "46.50")
-    publisher, adapters, store, _rates = _publisher(settings, rates=rates)
-
-    results = publisher.publish([_computed(price="47.00", cap="47.20")])
-
-    assert adapters["binance"].built == [("create", "Binance#1", Decimal("46.50"), True)]
-    assert results[0].price == Decimal("46.50")
-    assert store.get("Binance#1", UAH_USDT).price == Decimal("46.50")
-
-
-@pytest.mark.parametrize("price", ["47.00", "46.51", "60.00"])
-def test_no_published_price_ever_exceeds_the_stored_cap(settings, price: str) -> None:
-    rates = RateStore()
-    rates.set_cap("UAH/USDT", "46.50")
-    publisher, adapters, _store, _rates = _publisher(settings, rates=rates)
-
-    results = publisher.publish([_computed(price=price)])
-
-    for result in results:
-        assert result.price is not None
-        assert result.price <= Decimal("46.50")
-    for _kind, _account, sent_price, _active in adapters["binance"].built:
-        assert sent_price <= Decimal("46.50")
-
-
-def test_computed_cap_is_the_fallback_when_the_store_has_none(settings) -> None:
-    publisher, adapters, _store, _rates = _publisher(settings, rates=RateStore())
-    publisher.publish([_computed(price="47.00", cap="46.40")])
-    assert adapters["binance"].built[0][2] == Decimal("46.40")
-
-
-def test_a_price_below_the_cap_is_untouched(settings) -> None:
-    rates = RateStore()
-    rates.set_cap("UAH/USDT", "47.20")
-    publisher, adapters, _store, _rates = _publisher(settings, rates=rates)
-    publisher.publish([_computed(price="47.00")])
-    assert adapters["binance"].built[0][2] == Decimal("47.00")
-
-
-# -- dry run ---------------------------------------------------------------------------
-def test_dry_run_builds_no_request_and_writes_nothing(settings, tmp_path: Path) -> None:
-    ledger = tmp_path / "ads.json"
-    publisher, adapters, store, _rates = _publisher(settings, store=AdStore(path=ledger))
-
-    results = publisher.publish([_computed()], dry_run=True)
-
-    assert adapters["binance"].built == []
-    assert adapters["binance"].sent == []
-    assert [result.status for result in results] == ["dry_run"]
-    assert results[0].dry_run is True
-    assert results[0].price == Decimal("47.00")
-    assert store.items() == ()
-    assert not ledger.exists()
-
-
-def test_constructor_dry_run_default_is_used_when_the_call_does_not_decide(settings) -> None:
-    publisher, adapters, _store, _rates = _publisher(settings, dry_run=True)
-    results = publisher.publish([_computed()])
-    assert results[0].dry_run is True
-    assert adapters["binance"].built == []
-
-
-def test_call_level_dry_run_false_overrides_the_constructor(settings) -> None:
-    publisher, adapters, _store, _rates = _publisher(settings, dry_run=True)
-    results = publisher.publish([_computed()], dry_run=False)
-    assert results[0].status == "created"
-    assert len(adapters["binance"].built) == 1
-
-
-def test_dry_run_reports_an_adv_no_only_when_one_is_remembered(settings) -> None:
-    store = AdStore()
-    store.put(AdRecord(account_id="Binance#1", pair=UAH_USDT, adv_no="77", price=Decimal("47.00")))
-    publisher, _adapters, _store, _rates = _publisher(settings, store=store)
-    results = publisher.publish([_computed()], dry_run=True)
-    assert results[0].adv_no == "77"
-
-
-# -- create vs update ------------------------------------------------------------------
-def test_first_publish_creates_and_remembers_the_advertisement(settings, tmp_path: Path) -> None:
-    ledger = tmp_path / "ads.json"
-    store = AdStore(path=ledger)
-    publisher, adapters, _store, _rates = _publisher(settings, store=store)
-
-    results = publisher.publish([_computed()])
-
-    assert results[0].status == "created"
-    assert results[0].adv_no == "2048"
-    assert [entry[0] for entry in adapters["binance"].built] == ["create"]
-    record = store.get("Binance#1", UAH_USDT)
-    assert record.adv_no == "2048"
-    assert record.price == Decimal("47.00")
-    assert record.active is True
-    assert record.updated_at is not None
-    assert ledger.is_file()
-
-    reloaded = AdStore.load(ledger)
-    assert reloaded.get("Binance#1", "uah/usdt") == record
-    assert reloaded.as_dict() == store.as_dict()
-
-
-def test_second_publish_updates_the_remembered_advertisement(settings) -> None:
-    store = AdStore()
-    store.put(AdRecord(account_id="Binance#1", pair=UAH_USDT, adv_no="2048", price=Decimal("47.00")))
-    publisher, adapters, _store, _rates = _publisher(settings, store=store)
-
-    results = publisher.publish([_computed(price="47.10")])
-
-    assert results[0].status == "updated"
-    assert results[0].adv_no == "2048"
-    assert [entry[0] for entry in adapters["binance"].built] == ["update"]
-    assert adapters["binance"].sent[-1][1] == "update:Binance#1:2048"
-    assert store.get("Binance#1", UAH_USDT).price == Decimal("47.10")
-
-
-def test_update_keeps_the_previous_adv_no_when_the_venue_omits_it(settings) -> None:
-    store = AdStore()
-    store.put(AdRecord(account_id="Binance#1", pair=UAH_USDT, adv_no="2048", price=Decimal("47.00")))
-    adapters = {"binance": _FakeAdapter("binance", adv_no=None)}
-    publisher, _adapters, _store, _rates = _publisher(settings, adapters=adapters, store=store)
-
-    results = publisher.publish([_computed()])
-    assert results[0].adv_no == "2048"
-    assert store.get("Binance#1", UAH_USDT).adv_no == "2048"
-
-
-def test_create_missing_false_skips_an_unknown_account(settings) -> None:
-    store = AdStore()
-    store.put(AdRecord(account_id="Binance#1", pair=UAH_USDC, adv_no="555", price=Decimal("46.75")))
-    publisher, adapters, _store, _rates = _publisher(settings, store=store)
-
-    results = publisher.publish([_computed()], create_missing=False)
-
-    assert results[0].status == "skipped"
-    assert results[0].price == Decimal("47.00")
-    assert adapters["binance"].built == []
-
-
-def test_create_missing_false_still_updates_a_known_advertisement(settings) -> None:
-    store = AdStore()
-    store.put(AdRecord(account_id="Binance#1", pair=UAH_USDT, adv_no="2048", price=Decimal("47.00")))
-    publisher, adapters, _store, _rates = _publisher(settings, store=store)
-    results = publisher.publish([_computed()], create_missing=False)
-    assert results[0].status == "updated"
-    assert [entry[0] for entry in adapters["binance"].built] == ["update"]
-
-
-def test_active_flag_is_forwarded_to_the_venue(settings) -> None:
-    publisher, adapters, _store, _rates = _publisher(settings)
-    results = publisher.publish([_computed()], active=False)
-    assert adapters["binance"].built[0][3] is False
-    assert results[0].status == "created"
-
-
-# -- per-account isolation -------------------------------------------------------------
-def test_one_failing_account_does_not_stop_the_others(settings) -> None:
-    class _FailingOneAccount(_FakeAdapter):
-        def send_private(self, account, request):
-            if account.id == "Binance#1":
-                raise TransportError("connection reset by peer")
-            return super().send_private(account, request)
-
-    adapters = {"binance": _FailingOneAccount("binance")}
-    publisher, _adapters, store, _rates = _publisher(settings, adapters=adapters)
-
-    results = publisher.publish([_computed(accounts=("Binance#1", "Binance#2"))])
-
-    assert [result.account_id for result in results] == ["Binance#1", "Binance#2"]
-    assert results[0].status == "error"
-    assert results[0].error == "TransportError: connection reset by peer"
-    assert results[1].status == "created"
-    assert store.get("Binance#2", UAH_USDT) is not None
-    assert store.get("Binance#1", UAH_USDT) is None
-
-
-def test_unknown_account_is_reported_without_a_request(settings) -> None:
-    publisher, adapters, _store, _rates = _publisher(settings)
-    results = publisher.publish([_computed(accounts=("Kraken#1",))])
-    assert results[0].status == "error"
-    assert "Kraken#1" in results[0].error
-    assert adapters["binance"].built == []
-
-
-def test_missing_adapter_is_reported(settings) -> None:
-    publisher, _adapters, _store, _rates = _publisher(settings, adapters={})
-    results = publisher.publish([_computed()])
-    assert results[0].status == "error"
-    assert results[0].error == "no adapter registered for platform 'binance'"
-
-
-def test_duplicate_accounts_are_published_once(settings) -> None:
-    publisher, adapters, _store, _rates = _publisher(settings)
-    results = publisher.publish([_computed(accounts=("Binance#1", "Binance#1"))])
-    assert len(results) == 1
-    assert len(adapters["binance"].built) == 1
-
-
-def test_an_error_result_never_carries_a_price_above_the_cap(settings) -> None:
-    rates = RateStore()
-    rates.set_cap("UAH/USDT", "46.50")
-    adapters = {"binance": _FakeAdapter("binance", error=TransportError("boom"))}
-    publisher, _adapters, _store, _rates = _publisher(settings, adapters=adapters, rates=rates)
-    results = publisher.publish([_computed(price="47.00")])
-    assert results[0].status == "error"
-    assert results[0].price == Decimal("46.50")
-
-
-# -- sessions --------------------------------------------------------------------------
-def test_venues_without_a_session_need_no_extra_call(settings) -> None:
-    """All three shipped venues return ``None`` from build_login_request."""
-    adapters = {
-        name: _FakeAdapter(name) for name in ("binance", "okx", "bybit")
-    }
-    publisher, _adapters, _store, _rates = _publisher(settings, adapters=adapters)
-    publisher.publish(
-        [
-            _computed(platform="binance", accounts=("Binance#1",)),
-            _computed(platform="okx", accounts=("Okx#1",)),
-            _computed(platform="bybit", accounts=("Bybit#1",)),
-        ]
-    )
-    for name in ("binance", "okx", "bybit"):
-        assert adapters[name].logins != []
-        assert len(adapters[name].sent) == 1  # only the create request
-
-
-def test_a_required_session_is_established_once_per_account(settings) -> None:
-    adapter = _FakeAdapter("binance", login_request="login-request")
-    publisher, _adapters, _store, _rates = _publisher(settings, adapters={"binance": adapter})
-
-    publisher.publish(
-        [
-            _computed(platform="binance", accounts=("Binance#1",)),
-            _computed(pair="UAH/USDC", platform="binance", accounts=("Binance#1",)),
-        ]
-    )
-    assert adapter.sent[0] == ("Binance#1", "login-request")
-    assert sum(1 for _account, request in adapter.sent if request == "login-request") == 1
-    assert len(adapter.built) == 2
-
-
-def test_a_failing_session_reports_the_account_and_stops_retrying(settings) -> None:
-    adapter = _FakeAdapter(
-        "binance", login_request="login-request", login_error=TransportError("no session")
-    )
-    publisher, _adapters, store, _rates = _publisher(settings, adapters={"binance": adapter})
-
-    results = publisher.publish(
-        [
-            _computed(pair="UAH/USDT", accounts=("Binance#1",)),
-            _computed(pair="UAH/USDC", accounts=("Binance#1",)),
-        ]
-    )
-    assert [result.status for result in results] == ["error", "error"]
-    assert results[0].error == "TransportError: no session"
-    assert results[1].error == "TransportError: no session"
-    assert adapter.built == []
-    assert store.items() == ()
-
-
-# -- plan wiring -----------------------------------------------------------------------
-def test_publish_without_a_plan_uses_default_amounts(settings, caplog) -> None:
-    publisher, _adapters, _store, _rates = _publisher(settings)
-    assert publisher.plan_for("UAH/USDT") is None
-    with caplog.at_level("WARNING"):
-        publisher.publish([_computed()])
-    assert "no pair plan for UAH/USDT" in caplog.text
-
-
-def test_set_blueprint_supplies_the_publish_plan(uah_blueprint, settings) -> None:
-    publisher, adapters, _store, _rates = _publisher(settings)
-    publisher.set_blueprint(uah_blueprint)
-    plan = publisher.plan_for("uah/usdt")
-    assert plan is not None
-    assert plan.pair == UAH_USDT
-    publisher.publish([_computed()])
-    assert adapters["binance"].built != []
-
-
-def test_plan_for_reports_an_unknown_pair(uah_blueprint, settings) -> None:
-    publisher, _adapters, _store, _rates = _publisher(settings, plans=uah_blueprint)
-    with pytest.raises(ConfigError, match="has no pair UAH/TRY"):
-        publisher.plan_for("UAH/TRY")
-
-
-# -- build_ad_spec ---------------------------------------------------------------------
-def test_build_ad_spec_uses_the_blueprint_plan(uah_blueprint) -> None:
-    spec = build_ad_spec(_computed(), uah_blueprint)
-    assert spec.pair == UAH_USDT
-    assert spec.price == Decimal("47.00")
-    assert spec.min_amount == Decimal("1000")
-    assert spec.max_amount == Decimal("200000")
-    assert spec.payment_methods == ("Monobank", "PrivatBank")
-    assert spec.active is True
-    assert spec.side == SIDE_SELL
-
-
-def test_build_ad_spec_accepts_a_single_plan_and_overrides(uah_blueprint) -> None:
-    plan = uah_blueprint.pair("UAH/USDT")
-    spec = build_ad_spec(_computed(), plan, price=Decimal("46.50"), active=False)
-    assert spec.price == Decimal("46.50")
-    assert spec.active is False
-
-
-def test_build_ad_spec_without_a_plan_uses_blueprint_defaults() -> None:
-    spec = build_ad_spec(_computed())
-    assert spec.min_amount == Decimal("1")
-    assert spec.max_amount == Decimal("1000000")
-    assert spec.payment_methods == ()
-    assert spec.active is True
-
-
-def test_build_ad_spec_rejects_a_mismatched_plan(uah_blueprint) -> None:
-    plan = uah_blueprint.pair("UAH/USDC")
-    with pytest.raises(ConfigError, match="pair plan is for UAH/USDC, not UAH/USDT"):
-        build_ad_spec(_computed(), plan)
-
-
-def test_build_ad_spec_rejects_a_blueprint_without_the_pair() -> None:
-    other = parse_blueprint(
-        {
-            "version": 1,
-            "name": "mini",
-            "fiat": "UAH",
-            "strategy": "fixed_spread",
-            "pairs": [{"pair": "UAH/USDT", "anchor": True, "accounts": ["Binance#1"]}],
-        }
-    )
-    with pytest.raises(ConfigError, match="has no pair UAH/USDC"):
-        build_ad_spec(_computed(pair="UAH/USDC"), other)
-
-
-def test_build_ad_spec_keeps_a_disabled_plan_inactive() -> None:
-    blueprint = parse_blueprint(
-        {
-            "version": 1,
-            "name": "off",
-            "fiat": "UAH",
-            "strategy": "fixed_spread",
-            "pairs": [
-                {"pair": "UAH/USDT", "anchor": True, "enabled": False, "accounts": ["Binance#1"]}
-            ],
-        }
-    )
-    assert build_ad_spec(_computed(), blueprint).active is False
-    assert build_ad_spec(_computed(), blueprint, active=True).active is True
+    publisher = AdPublisher(resolved, settings, ad_store, dry_run)
+    return publisher, resolved, ad_store
 
 
 # -- AdStore ---------------------------------------------------------------------------
@@ -591,35 +224,362 @@ def test_store_rejects_a_non_list_records_block() -> None:
         AdStore(data={"records": 5})
 
 
-def test_publish_result_is_the_documented_shape(settings) -> None:
-    publisher, _adapters, _store, _rates = _publisher(settings)
-    result = publisher.publish([_computed()])[0]
-    assert isinstance(result, PublishResult)
-    assert result.to_dict()["status"] == "created"
-    assert result.platform == "binance"
-    assert result.ok is True
-
-
-def test_spec_is_built_from_the_plan_for_the_venue(settings, uah_blueprint) -> None:
-    """The venue receives the plan's amounts/payment methods, not defaults."""
-    captured: list[AdSpec] = []
-
-    class _CapturingAdapter(_FakeAdapter):
-        def build_create_ad_request(self, account, spec, adv_no=None):
-            captured.append(spec)
-            return super().build_create_ad_request(account, spec, adv_no)
-
-    publisher, _adapters, _store, _rates = _publisher(
-        settings, adapters={"binance": _CapturingAdapter("binance")}, plans=uah_blueprint
-    )
-    publisher.publish([_computed()])
-    assert captured[0].min_amount == Decimal("1000")
-    assert captured[0].payment_methods == ("Monobank", "PrivatBank")
-
-
 def test_ledger_key_of_a_non_canonical_account_id_is_kept_verbatim() -> None:
     """A hand-edited ledger may hold an id AccountRef cannot parse; it must still resolve."""
     store = AdStore()
     store.put(AdRecord(account_id="legacy-account", pair=UAH_USDT, adv_no="1", price=Decimal("47.00")))
     assert store.get("legacy-account", UAH_USDT).adv_no == "1"
     assert [record.account_id for record in store.items()] == ["legacy-account"]
+
+
+# -- edit_ad ---------------------------------------------------------------------------
+USD_USDT = Pair.parse("USD/USDT")
+
+
+def _live(**fields) -> OwnAd:
+    """A live Binance#1 USD/USDT buy ad at a floating 90% (like the one on the venue)."""
+    values = dict(
+        platform="binance",
+        account_id="Binance#1",
+        adv_no="777",
+        pair=USD_USDT,
+        side="buy",
+        status="online",
+        price=Decimal("0.9"),
+        min_amount=Decimal("50"),
+        max_amount=Decimal("15000"),
+        quantity=Decimal("49000"),
+        total_quantity=Decimal("50000"),
+        price_floating_ratio=Decimal("90"),
+    )
+    values.update(fields)
+    return OwnAd(**values)
+
+
+def _editor(settings, *ads: OwnAd, store=None, **adapter_kwargs):
+    adapter = _FakeAdapter("binance", adv_no=None, own_ads=ads or (_live(),), **adapter_kwargs)
+    return _publisher(settings, adapters={"binance": adapter}, store=store)
+
+
+def test_edit_ad_changes_only_the_given_field_of_the_live_ad(settings, tmp_path: Path) -> None:
+    store = AdStore(path=tmp_path / "ads.json")
+    publisher, adapters, _store = _editor(settings, store=store)
+
+    result = publisher.edit_ad("Binance#1", "USD/USDT", "777", price_floating_ratio="91")
+
+    assert (result.status, result.adv_no) == ("updated", "777")
+    spec = adapters["binance"].specs[-1]
+    assert spec.side == "buy"  # never forced to sell
+    assert spec.price_floating_ratio == Decimal("91")  # stays floating
+    assert spec.price == Decimal("0.91")  # informational estimate: 0.9 * 91 / 90
+    assert (spec.min_amount, spec.max_amount) == (Decimal("50"), Decimal("15000"))
+    assert spec.quantity == Decimal("50000")  # the total amount, not the remaining one
+    assert spec.active is True
+    assert (spec.payment_methods, spec.payment_ids) == ((), ())  # the venue keeps its methods
+    assert adapters["binance"].sent[-1][1] == "update:Binance#1:777"
+    # an ad the ledger did not know for this pair is adopted
+    assert AdStore.load(tmp_path / "ads.json").get("Binance#1", USD_USDT).adv_no == "777"
+
+
+def test_edit_ad_overrides_limits_quantity_and_payment_methods(settings) -> None:
+    ad = _live(payment_ids=("7110",))
+    publisher, adapters, _store = _editor(settings, ad)
+
+    publisher.edit_ad(
+        "Binance#1",
+        USD_USDT,
+        "777",
+        min_amount="100",
+        max_amount="5000",
+        quantity="1000",
+        payment_methods=["Wise"],
+    )
+
+    spec = adapters["binance"].specs[-1]
+    assert (spec.min_amount, spec.max_amount, spec.quantity) == (
+        Decimal("100"), Decimal("5000"), Decimal("1000"),
+    )
+    assert (spec.payment_methods, spec.payment_ids) == (("Wise",), ())
+    assert spec.price_floating_ratio == Decimal("90")  # untouched
+
+
+def test_edit_ad_keeps_the_venue_payment_ids_when_none_are_given(settings) -> None:
+    publisher, adapters, _store = _editor(settings, _live(payment_ids=("7110", "12")))
+
+    publisher.edit_ad("Binance#1", USD_USDT, "777", max_amount="14000")
+
+    assert adapters["binance"].specs[-1].payment_ids == ("7110", "12")
+
+
+def test_edit_ad_with_a_price_makes_a_floating_ad_fixed(settings) -> None:
+    publisher, adapters, _store = _editor(settings)
+
+    result = publisher.edit_ad("Binance#1", USD_USDT, "777", price="0.89")
+
+    spec = adapters["binance"].specs[-1]
+    assert (spec.price, spec.price_floating_ratio) == (Decimal("0.89"), None)
+    assert result.price == Decimal("0.89")
+
+
+def test_edit_ad_uses_the_ledger_adv_no_and_leaves_a_different_ledger_ad_alone(settings) -> None:
+    store = AdStore()
+    store.put(AdRecord(account_id="Binance#1", pair=USD_USDT, adv_no="777", price=Decimal("0.9")))
+    other = _live(adv_no="888")
+    publisher, adapters, _store = _editor(settings, _live(), other, store=store)
+
+    by_ledger = publisher.edit_ad("Binance#1", USD_USDT, max_amount="14000")
+    explicit = publisher.edit_ad("Binance#1", USD_USDT, "888", max_amount="13000")
+
+    assert (by_ledger.adv_no, explicit.adv_no) == ("777", "888")
+    assert [request for _account, request in adapters["binance"].sent] == [
+        "update:Binance#1:777",
+        "update:Binance#1:888",
+    ]
+    assert store.get("Binance#1", USD_USDT).adv_no == "777"  # 888 is not the ledger's ad
+
+
+def test_edit_ad_switches_an_ad_off_alone(settings) -> None:
+    publisher, adapters, store = _editor(settings)
+
+    result = publisher.edit_ad("Binance#1", USD_USDT, "777", active=False)
+
+    assert result.status == "updated"
+    assert adapters["binance"].specs[-1].active is False
+    assert store.get("Binance#1", USD_USDT).active is False
+
+
+def test_edit_ad_brings_an_offline_ad_online_with_its_changes(settings) -> None:
+    publisher, adapters, _store = _editor(settings, _live(status="offline"))
+
+    result = publisher.edit_ad("Binance#1", USD_USDT, "777", price_floating_ratio="91", active=True)
+
+    assert result.status == "updated"
+    assert adapters["binance"].specs[-1].active is True
+
+
+def test_edit_ad_sends_the_price_asked_for_there_is_no_cap(settings) -> None:
+    publisher, adapters, _store = _editor(settings)
+
+    result = publisher.edit_ad("Binance#1", USD_USDT, "777", price="99.99")
+
+    assert result.price == Decimal("99.99")
+    assert adapters["binance"].specs[-1].price == Decimal("99.99")
+
+
+@pytest.mark.parametrize(
+    ("ads", "kwargs", "message"),
+    [
+        ((), {"price": "0.9"}, "Binance#1 has no advertisement 777"),
+        ((_live(pair=Pair.parse("EUR/USDT")),), {"price": "0.9"}, "is EUR/USDT, not USD/USDT"),
+        ((_live(status="closed"),), {"price": "0.9"}, "advertisement 777 is closed"),
+        ((_live(side=""),), {"price": "0.9"}, "is a side-less ad; only buy ads are handled"),
+        ((_live(side="sell"),), {"price": "0.9"}, "is a sell ad; only buy ads are handled"),
+        ((_live(side="sell"),), {"active": False}, "is a sell ad; only buy ads are handled"),
+        ((_live(),), {}, "nothing to change"),
+        ((_live(),), {"active": False, "price": "0.9"}, "active=False only switches the ad off"),
+        ((_live(status="offline"),), {"price": "0.9"}, "pass active=True"),
+        ((_live(),), {"price": "0.9", "price_floating_ratio": "91"}, "not both"),
+        ((_live(),), {"price": "0"}, "price must be positive"),
+        ((_live(),), {"price": 0.9}, "floats are rejected"),
+        ((_live(),), {"price_floating_ratio": "-1"}, "price_floating_ratio must be positive"),
+        ((_live(price_floating_ratio=None),), {"price_floating_ratio": "91"}, "no floating price"),
+        ((_live(price=None),), {"max_amount": "100"}, "reports no price"),
+        ((_live(min_amount=None),), {"price": "0.9"}, "no order limits"),
+        ((_live(total_quantity=None),), {"price": "0.9"}, "pass quantity"),
+        ((_live(),), {"min_amount": "0"}, "min_amount must be positive"),
+        ((_live(),), {"max_amount": "10"}, "below min_amount"),
+        ((_live(),), {"quantity": "0"}, "quantity must be positive"),
+    ],
+)
+def test_edit_ad_refuses_what_it_cannot_do_safely(settings, ads, kwargs, message) -> None:
+    adapter = _FakeAdapter("binance", own_ads=ads)
+    publisher, _adapters, _store = _publisher(settings, adapters={"binance": adapter})
+
+    result = publisher.edit_ad("Binance#1", USD_USDT, "777", **kwargs)
+
+    assert result.status == "error"
+    assert message in result.error
+    assert adapter.sent == []
+
+
+def test_edit_ad_establishes_a_required_session_once_before_the_update(settings) -> None:
+    publisher, adapters, _store = _editor(settings, login_request="login-request")
+
+    publisher.edit_ad("Binance#1", USD_USDT, "777", max_amount="14000")
+
+    assert [request for _account, request in adapters["binance"].sent] == [
+        "login-request",
+        "update:Binance#1:777",
+    ]
+
+
+def test_edit_ad_reports_a_failing_session_without_updating(settings) -> None:
+    publisher, adapters, store = _editor(
+        settings, login_request="login-request", login_error=TransportError("no session")
+    )
+
+    result = publisher.edit_ad("Binance#1", USD_USDT, "777", max_amount="14000")
+
+    assert (result.status, result.error) == ("error", "TransportError: no session")
+    assert adapters["binance"].built == []
+    assert store.items() == ()
+
+
+def test_edit_ad_dry_run_reads_but_sends_and_stores_nothing(settings, tmp_path: Path) -> None:
+    publisher, adapters, store = _editor(settings, store=AdStore(path=tmp_path / "ads.json"))
+
+    result = publisher.edit_ad("Binance#1", USD_USDT, "777", price_floating_ratio="91", dry_run=True)
+
+    assert (result.status, result.price) == ("dry_run", Decimal("0.91"))
+    assert adapters["binance"].sent == []
+    assert store.items() == ()
+    assert not (tmp_path / "ads.json").exists()
+
+
+def test_edit_ad_reports_accounts_adapters_ledger_gaps_and_venue_errors(settings) -> None:
+    publisher, _adapters, _store = _editor(settings)
+    no_adapter, _a, _s = _publisher(settings, adapters={})
+    unreadable, _a2, _s2 = _editor(settings, list_error=TransportError("down"))
+    failing, _a3, _s3 = _editor(settings, error=TransportError("boom"))
+
+    assert "unknown account" in publisher.edit_ad("Binance#9", USD_USDT, "777", price="0.9").error
+    assert "pass adv_no" in publisher.edit_ad("Binance#1", USD_USDT, price="0.9").error
+    assert "no adapter registered" in no_adapter.edit_ad("Binance#1", USD_USDT, "777", price="0.9").error
+    assert unreadable.edit_ad("Binance#1", USD_USDT, "777", price="0.9").error == (
+        "cannot read the advertisement: TransportError: down"
+    )
+    assert failing.edit_ad("Binance#1", USD_USDT, "777", price="0.9").error == "TransportError: boom"
+
+
+# -- fetch_own_ads ---------------------------------------------------------------------
+class _ListingAdapter:
+    """Adapter double answering ``fetch_own_ads`` with fixed ads (or an error)."""
+
+    def __init__(self, platform: str, statuses=("online",), error: BaseException | None = None):
+        self.platform = platform
+        self.statuses = statuses
+        self.error = error
+        self.asked: list[str] = []
+
+    def fetch_own_ads(self, account):
+        self.asked.append(account.id)
+        if self.error is not None:
+            raise self.error
+        return tuple(
+            OwnAd(
+                platform=self.platform,
+                account_id=account.id,
+                adv_no=f"{account.id}-{index}",
+                pair=UAH_USDT,
+                side=SIDE_BUY,
+                status=status,
+            )
+            for index, status in enumerate(self.statuses)
+        )
+
+
+def test_fetch_own_ads_reads_every_configured_account_in_platform_order(settings) -> None:
+    adapters = {
+        "binance": _ListingAdapter("binance", statuses=("online", "offline", "closed")),
+        "okx": _ListingAdapter("okx", statuses=("offline",)),
+        "bybit": _ListingAdapter("bybit", statuses=()),
+    }
+    publisher, _adapters, store = _publisher(settings, adapters=adapters)
+
+    results = publisher.fetch_own_ads()
+
+    assert [result.account_id for result in results] == ["Binance#1", "Binance#2", "Okx#1", "Bybit#1"]
+    assert all(result.ok for result in results)
+    binance = results[0]
+    assert [(ad.adv_no, ad.status, ad.active) for ad in binance.ads] == [
+        ("Binance#1-0", "online", True),
+        ("Binance#1-1", "offline", False),
+    ]
+    assert [ad.status for ad in results[2].ads] == ["offline"]
+    assert results[3].ads == ()
+    assert store.items() == ()  # reading never touches the ledger
+    assert binance.to_dict()["ads"][1] == {
+        "platform": "binance",
+        "account_id": "Binance#1",
+        "adv_no": "Binance#1-1",
+        "pair": "UAH/USDT",
+        "side": "buy",
+        "status": "offline",
+        "active": False,
+        "price": None,
+        "min_amount": None,
+        "max_amount": None,
+        "quantity": None,
+        "payment_methods": [],
+        "venue_status": "",
+        "total_quantity": None,
+        "price_floating_ratio": None,
+        "payment_ids": [],
+    }
+
+
+def test_fetch_own_ads_can_include_closed_ads_and_select_accounts(settings) -> None:
+    adapters = {"binance": _ListingAdapter("binance", statuses=("online", "closed"))}
+    publisher, _adapters, _store = _publisher(settings, adapters=adapters)
+
+    results = publisher.fetch_own_ads(["binance#2"], include_closed=True)
+
+    assert [result.account_id for result in results] == ["Binance#2"]
+    assert [ad.status for ad in results[0].ads] == ["online", "closed"]
+    assert adapters["binance"].asked == ["Binance#2"]
+
+
+def test_fetch_own_ads_isolates_a_failing_account(settings) -> None:
+    adapters = {
+        "binance": _ListingAdapter("binance"),
+        "okx": _ListingAdapter("okx", error=TransportError("timed out")),
+    }
+    publisher, _adapters, _store = _publisher(settings, adapters=adapters)
+
+    results = publisher.fetch_own_ads(["Okx#1", "Binance#1", "Bybit#1", "Binance#9"])
+
+    okx, binance, bybit, unknown = results
+    assert not okx.ok and okx.error == "TransportError: timed out" and okx.ads == ()
+    assert binance.ok and len(binance.ads) == 1
+    assert bybit.error == "no adapter registered for platform 'bybit'"
+    assert unknown.platform == "" and "unknown account" in unknown.error
+    assert okx.to_dict() == {"account_id": "Okx#1", "platform": "okx", "ads": [], "error": "TransportError: timed out"}
+
+
+# -- DISABLED_EXCHANGES -------------------------------------------------------------------
+@pytest.fixture
+def okx_off(env_factory):
+    from p2pbot.config import load_settings
+
+    return load_settings(env_path=None, env=env_factory(DISABLED_EXCHANGES=" OKX , "), dotenv=False)
+
+
+def test_disabled_exchanges_are_parsed_and_validated(okx_off, env_factory) -> None:
+    from p2pbot.config import load_settings
+
+    assert okx_off.disabled_platforms == frozenset({"okx"})
+    bad = load_settings(env_path=None, env=env_factory(DISABLED_EXCHANGES="okx,kraken"), dotenv=False)
+    with pytest.raises(ConfigError, match="DISABLED_EXCHANGES has unknown exchange.s. kraken"):
+        bad.disabled_platforms
+
+
+def test_a_disabled_exchange_is_never_listed(okx_off) -> None:
+    adapters = {name: _ListingAdapter(name) for name in ("binance", "okx", "bybit")}
+    publisher, _adapters, _store = _publisher(okx_off, adapters=adapters)
+
+    every = publisher.fetch_own_ads()
+    named = publisher.fetch_own_ads(["Okx#1", "Bybit#1"])
+
+    assert [result.account_id for result in every] == ["Binance#1", "Binance#2", "Bybit#1"]
+    assert [result.account_id for result in named] == ["Bybit#1"]
+    assert adapters["okx"].asked == []
+
+
+def test_a_disabled_exchange_is_never_edited(okx_off) -> None:
+    okx = _FakeAdapter("okx", own_ads=(_live(platform="okx", account_id="Okx#1"),))
+    publisher, _adapters, _store = _publisher(okx_off, adapters={"okx": okx})
+
+    result = publisher.edit_ad("Okx#1", USD_USDT, "777", price="0.9")
+
+    assert (result.status, result.error) == ("error", "okx is disabled (DISABLED_EXCHANGES)")
+    assert okx.sent == []

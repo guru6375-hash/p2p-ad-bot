@@ -316,6 +316,9 @@ class AdSpec:
     optional: an adapter derives a sensible default when they are absent (Binance resolves
     ``payId`` from the account's own payment methods by name, Bybit falls back to the
     documented sample value).
+
+    ``price_floating_ratio`` (percent of the venue's reference price, e.g. ``91``) makes the
+    ad a floating-price ad; ``price`` is then only informational. Only Binance supports it.
     """
 
     pair: Pair
@@ -327,6 +330,7 @@ class AdSpec:
     side: str = "sell"
     quantity: Decimal | None = None
     payment_ids: tuple[str, ...] = ()
+    price_floating_ratio: Decimal | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -339,19 +343,19 @@ class AdSpec:
             "side": self.side,
             "quantity": _decimal_to_str(self.quantity),
             "payment_ids": list(self.payment_ids),
+            "price_floating_ratio": _decimal_to_str(self.price_floating_ratio),
         }
 
 
 @dataclass(frozen=True)
 class AdActionResult:
-    """Outcome of a venue call that created or updated one advertisement."""
+    """Outcome of a venue call that updated one advertisement."""
 
     platform: str
     account_id: str
     pair: Pair
     adv_no: str | None
     price: Decimal
-    created: bool
     raw: Mapping[str, Any] = field(default_factory=dict)
 
 
@@ -391,7 +395,7 @@ class AdRecord:
 
 @dataclass(frozen=True)
 class PublishResult:
-    """Outcome of one create/update attempt for one account."""
+    """Outcome of one update attempt for one account."""
 
     account_id: str
     platform: str
@@ -404,7 +408,7 @@ class PublishResult:
 
     @property
     def ok(self) -> bool:
-        return self.status in ("created", "updated", "skipped", "dry_run")
+        return self.status in ("updated", "skipped", "dry_run")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -442,6 +446,93 @@ class ComputedAd:
             "base": _decimal_to_str(self.base),
             "clamped": self.clamped,
             "accounts": list(self.accounts),
+        }
+
+
+#: Venue-independent states of an :class:`OwnAd`.
+AD_STATUS_ONLINE = "online"
+AD_STATUS_OFFLINE = "offline"
+AD_STATUS_CLOSED = "closed"
+AD_STATUS_UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class OwnAd:
+    """One of our own advertisements exactly as a venue lists it, whatever its state.
+
+    ``status`` is normalized to :data:`AD_STATUS_ONLINE` / :data:`AD_STATUS_OFFLINE` /
+    :data:`AD_STATUS_CLOSED` / :data:`AD_STATUS_UNKNOWN`; ``venue_status`` keeps the venue's
+    own code. ``payment_methods`` are what the venue reports: display names on Binance,
+    payment ids on Bybit. ``quantity`` is the crypto amount still available on the ad.
+
+    Fields an update needs to leave the ad as it is: ``total_quantity`` is the amount the
+    venue's update field takes (Binance ``initAmount``; Bybit ``lastQuantity``, because its
+    update ``quantity`` is the amount left on the ad);
+    ``price_floating_ratio`` is set for a floating-price ad (percent of the reference
+    price); ``payment_ids`` are the payment references an update must send to keep the
+    current methods (empty on Binance, whose adapter keeps them from the ad itself).
+    """
+
+    platform: str
+    account_id: str
+    adv_no: str
+    pair: Pair
+    side: str
+    status: str
+    price: Decimal | None = None
+    min_amount: Decimal | None = None
+    max_amount: Decimal | None = None
+    quantity: Decimal | None = None
+    payment_methods: tuple[str, ...] = ()
+    venue_status: str = ""
+    total_quantity: Decimal | None = None
+    price_floating_ratio: Decimal | None = None
+    payment_ids: tuple[str, ...] = ()
+
+    @property
+    def active(self) -> bool:
+        return self.status == AD_STATUS_ONLINE
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "platform": self.platform,
+            "account_id": self.account_id,
+            "adv_no": self.adv_no,
+            "pair": self.pair.symbol,
+            "side": self.side,
+            "status": self.status,
+            "active": self.active,
+            "price": _decimal_to_str(self.price),
+            "min_amount": _decimal_to_str(self.min_amount),
+            "max_amount": _decimal_to_str(self.max_amount),
+            "quantity": _decimal_to_str(self.quantity),
+            "payment_methods": list(self.payment_methods),
+            "venue_status": self.venue_status,
+            "total_quantity": _decimal_to_str(self.total_quantity),
+            "price_floating_ratio": _decimal_to_str(self.price_floating_ratio),
+            "payment_ids": list(self.payment_ids),
+        }
+
+
+@dataclass(frozen=True)
+class OwnAdsResult:
+    """The advertisements of one account, or the reason they could not be listed."""
+
+    account_id: str
+    platform: str
+    ads: tuple[OwnAd, ...] = ()
+    error: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.error is None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "account_id": self.account_id,
+            "platform": self.platform,
+            "ads": [ad.to_dict() for ad in self.ads],
+            "error": self.error,
         }
 
 

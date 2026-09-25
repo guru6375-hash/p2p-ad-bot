@@ -71,6 +71,7 @@ def make_spec(
     side: str = "sell",
     quantity: str | Decimal | None = None,
     payment_ids: Iterable[str] = (),
+    price_floating_ratio: str | Decimal | None = None,
 ) -> AdSpec:
     """An :class:`~p2pbot.models.AdSpec` built from decimal *strings* (money stays exact)."""
     resolved_pair = pair if isinstance(pair, Pair) else Pair.parse(pair)
@@ -84,6 +85,7 @@ def make_spec(
         side=side,
         quantity=None if quantity is None else Decimal(quantity),
         payment_ids=tuple(payment_ids),
+        price_floating_ratio=None if price_floating_ratio is None else Decimal(price_floating_ratio),
     )
 
 

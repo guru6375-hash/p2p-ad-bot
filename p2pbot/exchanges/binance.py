@@ -18,7 +18,6 @@ Two disjoint families are wrapped here (see ``docs/research/binance.md`` and
    ==========================================  ===========================================
    operation                                   request
    ==========================================  ===========================================
-   create                                      ``POST /sapi/v1/c2c/agent/ads/post``
    update (full object)                        ``POST /sapi/v1/c2c/agent/ads/update``
    on/off                                      ``POST /sapi/v1/c2c/agent/ads/updateStatus``
    list own ads                                ``POST .../ads/listWithPagination``
@@ -47,25 +46,14 @@ Known-unknowns (documented instead of silently assumed):
 * **``advStatus`` 2 vs 3.** Binance's API reference says ``3`` = Offline for writes while
   the same repository's display table says ``2``; this adapter sends ``3`` (as the
   reference states). ``1`` = Online, ``4`` = Closed.
-* **Static create defaults** that no ``AdSpec`` field exposes: ``classify="mass"``,
-  ``priceType=1`` (fixed price), ``buyerKycLimit=0``, ``onlineNow=true``,
-  ``payTimeLimit=15``; ``remarks``/``autoReplyMsg`` are omitted (the venue defaults apply).
-* **BUY advertisements** identify payment methods by ``identifier`` instead of ``payId``.
-  There is no documented source of identifier values in this adapter (Binance's
-  ``listAllTradeMethods`` is not part of the frozen scope), so a BUY create takes the
-  identifiers from ``AdSpec.payment_ids`` verbatim and resolves display names against the
-  account's own payment methods as a best effort — UNCONFIRMED, and unused by the
-  scenarios shipped with this project (they advertise ``sell``).
-* **Payment-method resolution fallback chain** (used by SELL creates, cached per
-  ``(account, fiat)`` on the adapter instance): (1) an exact case-insensitive match of
-  ``AdSpec.payment_methods`` against the account's own ``tradeMethodName``/``payType``/
-  ``identifier``/``payId``; (2) a case-insensitive substring match either way (venue names
-  often carry a parenthetical suffix); (3) numeric ``AdSpec.payment_ids`` matched against
-  the account's own ``payId`` values. Anything left unmatched raises :class:`ApiError`
-  naming the method (never a credential), and an ad with no configured payment method at
-  all is refused outright — a SELL ad without a ``payId`` is invalid.
+* **Buy advertisements only.** Ad updates are built for BUY ads alone; a sell spec is
+  refused before any request. BUY ads identify payment methods by ``identifier``: an update
+  keeps the ad's own identifiers, ``AdSpec.payment_ids`` are sent verbatim, and display
+  names in ``AdSpec.payment_methods`` are resolved against the account's own payment
+  methods (cached per ``(account, fiat)``): an exact case-insensitive match first, then a
+  substring match either way. Anything unmatched raises :class:`ApiError` naming the method.
 * Nothing here can be verified without live Binance merchant credentials: the whole
-  Agent SAPI family (create/update/status/list/pay-methods) is unauthenticated-untestable.
+  Agent SAPI family (update/status/list/pay-methods) is unauthenticated-untestable.
 """
 
 from __future__ import annotations
@@ -80,7 +68,19 @@ from typing import Any, Callable, ClassVar, Iterable, Mapping, Sequence
 
 from ..constants import SIDE_BUY, SIDE_SELL
 from ..errors import ApiError, ConfigError
-from ..models import Account, AdActionResult, AdSpec, CompetitorAd, Pair, parse_decimal
+from ..models import (
+    AD_STATUS_CLOSED,
+    AD_STATUS_OFFLINE,
+    AD_STATUS_ONLINE,
+    AD_STATUS_UNKNOWN,
+    Account,
+    AdActionResult,
+    AdSpec,
+    CompetitorAd,
+    OwnAd,
+    Pair,
+    parse_decimal,
+)
 from .base import ExchangeAdapter, HttpRequest, Transport
 
 __all__ = ["BinanceAdapter"]
@@ -92,7 +92,6 @@ SEARCH_URL = "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search"
 
 # -- C2C Agent SAPI (API-key + HMAC-SHA256) --------------------------------------------
 API_BASE_URL = "https://api.binance.com"
-ADS_POST_PATH = "/sapi/v1/c2c/agent/ads/post"
 ADS_UPDATE_PATH = "/sapi/v1/c2c/agent/ads/update"
 ADS_UPDATE_STATUS_PATH = "/sapi/v1/c2c/agent/ads/updateStatus"
 ADS_LIST_PATH = "/sapi/v1/c2c/agent/ads/listWithPagination"
@@ -101,67 +100,35 @@ PAY_METHODS_PATH = "/sapi/v1/c2c/agent/ads/getPayMethodByUserId"
 
 #: Signature envelope: P2P endpoints accept up to 60000 ms (Binance's own reference).
 RECV_WINDOW_MS = 60000
-#: Ad defaults the venue requires but no ``AdSpec`` field exposes.
-#: Ad class Binance expects. Live-verified: a merchant account must publish with
-#: ``"profession"``; ``"mass"`` is refused with ``83749 You do not have permission``
-#: (the venue's own web client sends ``"profession"`` for such an account).
-DEFAULT_CLASSIFY = "profession"
-DEFAULT_PAY_TIME_LIMIT = 15
-DEFAULT_KYC_LIMIT = 1
+#: ``priceType`` of a fixed-price advertisement.
 DEFAULT_PRICE_TYPE = 1
+#: ``priceType`` of a floating-price advertisement (``priceFloatingRatio`` percent).
+FLOATING_PRICE_TYPE = 2
 
-#: ``tradeType`` spelling the ad endpoints expect (the *create* body uses words; the
-#: private search/update paths use ``PRIVATE_TRADE_TYPE``).
-ADS_TRADE_TYPE: dict[str, str] = {SIDE_SELL: "SELL", SIDE_BUY: "BUY"}
+#: ``tradeType`` spelling the ad update body expects: only buy ads are updated.
+ADS_TRADE_TYPE: dict[str, str] = {SIDE_BUY: "BUY"}
 
-#: Counterparty-condition defaults Binance's own web app sends for a normal advertisement.
-#: Verified live: an abbreviated body is rejected with ``-1000 System abnormality``; this
-#: full set is accepted by ``/sapi/v1/c2c/agent/ads/post``.
-ADS_CONDITION_DEFAULTS: dict[str, Any] = {
-    "autoReplyMsg": "",
-    "buyerRegDaysLimit": -1,
-    "buyerBtcPositionLimit": -1,
-    "userTransTimesLimitedMin": False,
-    "userTransTimesLimitedMax": False,
-    "userAllTradeCountMin": -1,
-    "userAllTradeCountMax": 1000000,
-    "userTradeCountFilterTime": None,
-    "userTradeCompleteRateMin": -1,
-    "userTradeCompleteCountMin": -1,
-    "userTransAmountLimitedMin": False,
-    "userTransAmountLimitedMax": False,
-    "userTradeVolumeMin": -1,
-    "userTradeVolumeMax": 1000000,
-    "allowTradeMerchant": 1,
-    "nonTradableRegions": [],
-    "userTradeVolumeFilterTime": None,
-    "userBuyTradeCountMin": -1,
-    "userBuyTradeCountMax": 1000000,
-    "userSellTradeCountMin": -1,
-    "userSellTradeCountMax": 1000000,
-    "visible": 1,
-    "onlineDelayTime": 0,
-    "remarks": "",
-    "takerAdditionalKycRequired": 0,
-    "isSafePayment": False,
-    "adAdditionalKycVerifyItems": [],
-    "adTags": [],
-    "isStarTraderCounterpartyConditionsExclusion": False,
-    "isStarTraderAdditionalKycExclusion": False,
-}
 #: Asset scale of the USDT/USDC amounts observed live (``adv.assetScale == 2``): a derived
 #: ``initAmount`` is floored to this quantum so the venue never sees a sub-unit quantity.
 DEFAULT_QUANTITY_QUANTUM = Decimal("0.01")
 #: ``advStatus`` enum for writes (1 = Online, 3 = Offline, 4 = Closed).
 ADV_STATUS_ONLINE = 1
 ADV_STATUS_OFFLINE = 3
+#: ``advStatus`` of a listed own ad -> :class:`~p2pbot.models.OwnAd` status. Both ``2`` and
+#: ``3`` read as offline (Binance's two reference pages disagree, see the module docstring).
+OWN_AD_STATUSES: dict[str, str] = {
+    "1": AD_STATUS_ONLINE,
+    "2": AD_STATUS_OFFLINE,
+    "3": AD_STATUS_OFFLINE,
+    "4": AD_STATUS_CLOSED,
+}
+#: ``tradeType`` of a listed own ad (reads say ``"SELL"``, writes use ``"1"``) -> side.
+OWN_AD_SIDES: dict[str, str] = {"SELL": SIDE_SELL, "1": SIDE_SELL, "BUY": SIDE_BUY, "0": SIDE_BUY}
 #: Envelope codes that mean "the venue reported success" ("000000" and numeric 0 shapes).
 SUCCESS_CODES: tuple[str, ...] = ("000000", "0")
 
 #: ``AdSpec.side`` -> public ``tradeType`` (the advertiser's own side).
 PUBLIC_TRADE_TYPE: dict[str, str] = {SIDE_SELL: "SELL", SIDE_BUY: "BUY"}
-#: ``AdSpec.side`` -> private ``tradeType`` (numeric enum: "0" = BUY, "1" = SELL).
-PRIVATE_TRADE_TYPE: dict[str, str] = {SIDE_SELL: "1", SIDE_BUY: "0"}
 
 #: Index of the points that cannot be verified without live Binance merchant credentials,
 #: with the decision taken for each (the prose lives in the module docstring's
@@ -219,6 +186,27 @@ def _optional_decimal(value: Any, field_name: str) -> Decimal | None:
     return parse_decimal(text, field_name)
 
 
+def _lenient_decimal(value: Any, field_name: str) -> Decimal | None:
+    """:func:`_optional_decimal` for a display-only field: junk reads as ``None``."""
+    try:
+        return _optional_decimal(value, field_name)
+    except ConfigError:
+        _log.debug("binance %s is not a decimal (%r); field ignored", field_name, value)
+        return None
+
+
+def _trade_method_names(methods: Any) -> tuple[str, ...]:
+    """Display names (``identifier`` as fallback) of an ad's ``tradeMethods``."""
+    if not isinstance(methods, list):
+        return ()
+    names = (
+        _text(method.get("tradeMethodName") or method.get("identifier"))
+        for method in methods
+        if isinstance(method, Mapping)
+    )
+    return tuple(name for name in names if name)
+
+
 def _normalized_rate(value: Any, field_name: str) -> Decimal | None:
     """A ``positiveRate``/``monthFinishRate`` on the shared ``0..1`` scale.
 
@@ -235,6 +223,8 @@ class BinanceAdapter(ExchangeAdapter):
     """Binance P2P adapter (public search + C2C Agent SAPI own-ad management)."""
 
     platform: ClassVar[str] = "binance"
+    #: ``listWithPagination`` returns at most 20 rows per page whatever ``rows`` asks for.
+    own_ads_page_size: ClassVar[int] = 20
 
     def __init__(
         self,
@@ -329,33 +319,46 @@ class BinanceAdapter(ExchangeAdapter):
             account, "POST", ADS_LIST_PATH, json_body={"page": 1, "rows": 100}
         )
 
-    def build_create_ad_request(
-        self, account: Account, spec: AdSpec, adv_no: str | None = None
-    ) -> HttpRequest:
-        """Publish a new advertisement (``adv_no`` is assigned by the venue, so ignored).
-
-        The ad is always published online; ``AdSpec.active`` drives the *update* path
-        (``updateStatus``), never the create.
-        """
-        body: dict[str, Any] = dict(ADS_CONDITION_DEFAULTS)
-        body.update(
-            {
-                "classify": DEFAULT_CLASSIFY,
-                "tradeType": self._ads_trade_type(spec.side),
-                "asset": spec.pair.crypto,
-                "fiatUnit": spec.pair.fiat,
-                "priceType": DEFAULT_PRICE_TYPE,
-                "price": _decimal_text(spec.price),
-                "initAmount": _decimal_text(self._ad_quantity(account, spec)),
-                "maxSingleTransAmount": _decimal_text(spec.max_amount),
-                "minSingleTransAmount": _decimal_text(spec.min_amount),
-                "buyerKycLimit": DEFAULT_KYC_LIMIT,
-                "tradeMethods": self._resolve_trade_methods(account, spec),
-                "onlineNow": True,
-                "payTimeLimit": DEFAULT_PAY_TIME_LIMIT,
-            }
+    def build_own_ads_request(self, account: Account, *, page: int) -> HttpRequest:
+        """One ``listWithPagination`` page: every own ad, whatever its pair or status."""
+        return self._signed_request(
+            account,
+            "POST",
+            ADS_LIST_PATH,
+            json_body={"page": int(page), "rows": self.own_ads_page_size},
         )
-        return self._signed_request(account, "POST", ADS_POST_PATH, json_body=body)
+
+    def parse_own_ad(self, row: Mapping[str, Any], account: Account) -> OwnAd | None:
+        """Normalize one ``AgentAdDetailResp`` row of the own-ad listing."""
+        adv_no = _text(row.get("advNo"))
+        try:
+            pair = Pair(fiat=_text(row.get("fiatUnit")), crypto=_text(row.get("asset")))
+        except ConfigError:
+            pair = None
+        if not adv_no or pair is None:
+            _log.debug("binance %s: skipped an own-ad row without advNo/asset/fiatUnit", account.id)
+            return None
+        venue_status = _text(row.get("advStatus"))
+        return OwnAd(
+            platform=self.platform,
+            account_id=account.id,
+            adv_no=adv_no,
+            pair=pair,
+            side=OWN_AD_SIDES.get(_text(row.get("tradeType")).upper(), ""),
+            status=OWN_AD_STATUSES.get(venue_status, AD_STATUS_UNKNOWN),
+            price=_lenient_decimal(row.get("price"), "price"),
+            min_amount=_lenient_decimal(row.get("minSingleTransAmount"), "minSingleTransAmount"),
+            max_amount=_lenient_decimal(row.get("maxSingleTransAmount"), "maxSingleTransAmount"),
+            quantity=_lenient_decimal(row.get("surplusAmount"), "surplusAmount"),
+            payment_methods=_trade_method_names(row.get("tradeMethods")),
+            venue_status=venue_status,
+            total_quantity=_lenient_decimal(row.get("initAmount"), "initAmount"),
+            price_floating_ratio=(
+                _lenient_decimal(row.get("priceFloatingRatio"), "priceFloatingRatio")
+                if _text(row.get("priceType")) == str(FLOATING_PRICE_TYPE)
+                else None
+            ),
+        )
 
     def build_update_ad_request(self, account: Account, spec: AdSpec, adv_no: str) -> HttpRequest:
         """Update an existing advertisement.
@@ -370,8 +373,11 @@ class BinanceAdapter(ExchangeAdapter):
           price, amounts, status and normalized ``tradeType`` overwritten.
 
         Unlike the other builders this one performs I/O; it is deterministic given
-        ``(account, spec, adv_no, now)`` plus the venue's own detail payload.
+        ``(account, spec, adv_no, now)`` plus the venue's own detail payload. Only buy ads
+        are handled: any other side is refused before a request is built.
         """
+        if str(spec.side).strip().lower() != SIDE_BUY:
+            raise ConfigError(f"binance: only buy advertisements are handled, not {spec.side!r}")
         if not spec.active:
             return self.build_status_request(account, adv_no, active=False)
         detail = self._fetch_ad_detail(account, adv_no)
@@ -408,11 +414,11 @@ class BinanceAdapter(ExchangeAdapter):
     def parse_ad_response(
         self, payload: Any, *, pair: Pair | None = None
     ) -> AdActionResult:
-        """Normalize a create/update payload, carrying only what the venue says.
+        """Normalize an update payload, carrying only what the venue says.
 
-        ``data`` is the new ``advNo`` string on create, ``true`` on update and the
-        ``{status, failList}`` object on ``updateStatus``; everything else (identity
-        fields, price, ``created``) is filled in by ``parse_ad_result``.
+        ``data`` is ``true`` on update and the ``{status, failList}`` object on
+        ``updateStatus``; everything else (identity fields, price) is filled in by
+        ``parse_ad_result``.
         """
         data = payload.get("data") if isinstance(payload, Mapping) else None
         adv_no: str | None = None
@@ -426,7 +432,6 @@ class BinanceAdapter(ExchangeAdapter):
             pair=pair if pair is not None else _UNKNOWN_PAIR,
             adv_no=adv_no,
             price=None,
-            created=False,
             raw=payload if isinstance(payload, Mapping) else {"payload": payload},
         )
 
@@ -435,13 +440,6 @@ class BinanceAdapter(ExchangeAdapter):
     def _public_trade_type(side: str) -> str:
         try:
             return PUBLIC_TRADE_TYPE[str(side).strip().lower()]
-        except KeyError as exc:
-            raise ConfigError(f"binance: unsupported side {side!r}") from exc
-
-    @staticmethod
-    def _private_trade_type(side: str) -> str:
-        try:
-            return PRIVATE_TRADE_TYPE[str(side).strip().lower()]
         except KeyError as exc:
             raise ConfigError(f"binance: unsupported side {side!r}") from exc
 
@@ -600,14 +598,23 @@ class BinanceAdapter(ExchangeAdapter):
 
         Every field the detail returned is echoed verbatim; only ``advNo`` (pinned to the
         ad we addressed), ``tradeType`` (normalized to the venue's own ``"SELL"``/``"BUY"`` spelling),
-        ``priceType``/``price``, the amounts, ``initAmount`` and ``advStatus`` are set.
+        ``priceType``/``price`` (``priceType``/``priceFloatingRatio`` for a spec with a
+        ``price_floating_ratio``, keeping the venue's own ``price``), the amounts,
+        ``initAmount`` and ``advStatus`` are set.
         Payment methods posted are the ones the ad already carries.
         """
         body: dict[str, Any] = {str(key): value for key, value in detail.items()}
         body["advNo"] = str(adv_no)
         body["tradeType"] = self._ads_trade_type(spec.side)
-        body["priceType"] = DEFAULT_PRICE_TYPE
-        body["price"] = _decimal_text(spec.price)
+        if spec.price_floating_ratio is None:
+            body["priceType"] = DEFAULT_PRICE_TYPE
+            body["price"] = _decimal_text(spec.price)
+            # a floating ad's echoed ratio keeps it floating: Binance answers success and
+            # ignores the fixed price, so the ratio goes when the ad becomes fixed-price
+            body.pop("priceFloatingRatio", None)
+        else:
+            body["priceType"] = FLOATING_PRICE_TYPE
+            body["priceFloatingRatio"] = _decimal_text(spec.price_floating_ratio)
         body["initAmount"] = _decimal_text(self._ad_quantity(account, spec))
         body["minSingleTransAmount"] = _decimal_text(spec.min_amount)
         body["maxSingleTransAmount"] = _decimal_text(spec.max_amount)
@@ -618,56 +625,36 @@ class BinanceAdapter(ExchangeAdapter):
     def _update_trade_methods(
         self, account: Account, detail: Mapping[str, Any], spec: AdSpec
     ) -> list[dict[str, Any]]:
-        """Write-shape ``tradeMethods`` for an update.
+        """Write-shape ``tradeMethods`` for a buy-ad update.
 
         ``getDetailByNo`` answers with the *read* shape (``identifier``/``tradeMethodName``/
-        ``iconUrlColor`` and no ``payId``); echoing it back is rejected live with
-        ``83664 You have not added any payment method yet``. The blueprint's methods are
-        resolved against the account (as on create); when the spec carries none, the ad's
-        own identifiers are mapped back onto the account's records so the published methods
-        survive the update unchanged.
+        ``iconUrlColor``); a buy ad is written back with its ``identifier`` values only. The
+        spec's methods, when it carries any, replace the ad's own.
         """
         if spec.payment_methods or spec.payment_ids:
             return self._resolve_trade_methods(account, spec)
-        records = self._own_pay_methods(account, spec.pair)
-        sell = self._private_trade_type(spec.side) == PRIVATE_TRADE_TYPE[SIDE_SELL]
         entries: list[dict[str, Any]] = []
         for current in detail.get("tradeMethods") or []:
             if not isinstance(current, Mapping):
                 continue
             wanted = _text(current.get("identifier")) or _text(current.get("payType"))
-            if not wanted:
-                continue
-            record = next(
-                (
-                    r
-                    for r in records
-                    if wanted in {_text(r.get("identifier")), _text(r.get("pay_type")), _text(r.get("name"))}
-                ),
-                None,
-            )
-            if record is None:
-                raise ApiError(
-                    f"binance: account {account.id} no longer offers payment method "
-                    f"{current.get('tradeMethodName') or wanted!r}; cannot update the advertisement"
-                )
-            entries.append(self._trade_method_entry(account, record, sell=sell))
+            if wanted:
+                entries.append({"identifier": wanted})
         if not entries:
             raise ApiError(
                 f"binance: advertisement {detail.get('advNo')} carries no payment method and "
-                "the blueprint supplies none; refusing to update it"
+                "the spec supplies none; refusing to update it"
             )
         return entries
 
     # -- internals: payment methods ------------------------------------------------
     def _resolve_trade_methods(self, account: Account, spec: AdSpec) -> list[dict[str, Any]]:
-        """``tradeMethods`` payload entries for a create, resolved per side.
+        """Buy-ad ``tradeMethods`` entries for the spec's payment methods.
 
-        SELL ads need a ``payId`` from the account's own payment methods; BUY ads need the
-        venue ``identifier``. Names that resolve to nothing raise :class:`ApiError` naming
-        the method (never a credential).
+        ``payment_ids`` are venue identifiers and are used as they are; display names are
+        resolved to an identifier through the account's own payment methods. Names that
+        resolve to nothing raise :class:`ApiError` naming the method (never a credential).
         """
-        sell = self._private_trade_type(spec.side) == PRIVATE_TRADE_TYPE[SIDE_SELL]
         names = [_text(name) for name in spec.payment_methods]
         names = [name for name in names if name]
         ids = [_text(value) for value in spec.payment_ids]
@@ -677,12 +664,8 @@ class BinanceAdapter(ExchangeAdapter):
                 f"binance: account {account.id} has no payment method configured for "
                 f"{spec.pair.symbol}; a {spec.side} advertisement cannot be published without one"
             )
-        entries: list[dict[str, Any]] = []
-        if not sell and ids:
-            # BUY ads address payment methods by identifier, so supplied ids are used as-is.
-            entries.extend({"identifier": value} for value in ids)
-            ids = []
-        if names or ids:
+        entries: list[dict[str, Any]] = [{"identifier": value} for value in ids]
+        if names:
             records = self._own_pay_methods(account, spec.pair)
             for name in names:
                 record = self._find_pay_method(records, name)
@@ -691,43 +674,12 @@ class BinanceAdapter(ExchangeAdapter):
                         f"binance: account {account.id} has no payment method matching "
                         f"{name!r} for {spec.pair.symbol}"
                     )
-                entries.append(self._trade_method_entry(account, record, sell=sell))
-            for value in ids:
-                record = self._record_by_pay_id(records, value)
-                if record is None:
-                    raise ApiError(
-                        f"binance: account {account.id} has no payment method with payId "
-                        f"{value!r} for {spec.pair.symbol}"
-                    )
-                entries.append(self._trade_method_entry(account, record, sell=sell))
+                entries.append(self._trade_method_entry(account, record))
         return _dedupe(entries)
 
-    def _trade_method_entry(
-        self, account: Account, record: Mapping[str, str], *, sell: bool
-    ) -> dict[str, Any]:
-        """One ``tradeMethods[]`` element for the create body."""
+    def _trade_method_entry(self, account: Account, record: Mapping[str, str]) -> dict[str, Any]:
+        """One buy-ad ``tradeMethods[]`` element: the method's venue ``identifier``."""
         label = record.get("name") or record.get("pay_id") or "?"
-        if sell:
-            pay_id = record.get("pay_id", "")
-            if not pay_id:
-                raise ApiError(
-                    f"binance: payment method {label!r} of account {account.id} carries no "
-                    "payId; it cannot be used on a sell advertisement"
-                )
-            pay_type = record.get("pay_type", "")
-            return {
-                "identifier": (
-                    record.get("identifier", "")
-                    or pay_type
-                    or str(record.get("pay_id", ""))
-                ),
-                "payId": int(pay_id) if pay_id.isdigit() else pay_id,
-                "payType": pay_type,
-                "payAccount": None,
-                "payBank": None,
-                "paySubBank": None,
-                "tradeMethodName": record.get("name", "") or pay_type,
-            }
         identifier = record.get("identifier") or record.get("pay_type") or record.get("pay_id", "")
         if not identifier:
             raise ApiError(
@@ -808,17 +760,6 @@ class BinanceAdapter(ExchangeAdapter):
             if loose is None and any(wanted in field or field in wanted for field in folded):
                 loose = record
         return exact if exact is not None else loose
-
-    @staticmethod
-    def _record_by_pay_id(
-        records: Iterable[Mapping[str, str]], pay_id: str
-    ) -> Mapping[str, str] | None:
-        wanted = pay_id.strip()
-        for record in records:
-            if record.get("pay_id", "").strip() == wanted:
-                return record
-        return None
-
 
 def _dedupe(entries: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     """Drop repeated ``tradeMethods`` entries, keeping the first occurrence."""

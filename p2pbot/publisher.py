@@ -2,21 +2,16 @@
 
 This module owns two things:
 
-* :class:`AdStore` — the local ledger of the advertisements we created
-  (``(account_id, pair) -> AdRecord``), persisted as JSON so that a restart *updates* the
-  existing advertisements instead of creating duplicates.
-* :class:`AdPublisher` — pushes a computed price to every account of every pair. The
-  stored ``cap_rate`` is re-asserted immediately before a request is built (defence in
-  depth: the engine clamps as well, but the publisher is the last line of defence).
+* :class:`AdStore` — the local ledger of the advertisements we manage
+  (``(account_id, pair) -> AdRecord``), persisted as JSON so that a pair's ad can be found
+  again by :meth:`AdPublisher.edit_ad`.
+* :class:`AdPublisher` — reads the live advertisements of every account
+  (:meth:`~AdPublisher.fetch_own_ads`) and edits one existing **buy** ad at a time
+  (:meth:`~AdPublisher.edit_ad`). It never creates an advertisement and never touches a
+  sell ad. There is no cap: the price asked for is the price sent.
 
-:func:`build_ad_spec` turns one :class:`~p2pbot.models.ComputedAd` plus the active
-blueprint (or a single :class:`~p2pbot.blueprint.PairPlan`) into the venue-facing
-:class:`~p2pbot.models.AdSpec`: the price comes from the computed ad, the amount bounds and
-payment methods come from the pair plan, and the side defaults to ``sell``.
-
-The publisher never raises for a per-account fault: every failure is captured into a
-:class:`~p2pbot.models.PublishResult` with ``status="error"`` so the remaining accounts of
-the same pair are still published.
+Per-account faults are never raised: they are captured into the returned
+:class:`~p2pbot.models.PublishResult` / :class:`~p2pbot.models.OwnAdsResult`.
 """
 
 from __future__ import annotations
@@ -27,26 +22,27 @@ from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
-from .blueprint import DEFAULT_MAX_AMOUNT, DEFAULT_MIN_AMOUNT, Blueprint, PairPlan
 from .config import Settings
-from .constants import SIDE_SELL
+from .constants import PLATFORMS, SIDE_BUY
 from .errors import BotError, ConfigError, ExchangeError
 from .logging_setup import get_logger
 from .models import (
+    AD_STATUS_CLOSED,
     AccountRef,
     AdRecord,
     AdSpec,
-    ComputedAd,
+    OwnAd,
+    OwnAdsResult,
     Pair,
     PublishResult,
+    parse_decimal,
     utcnow,
 )
-from .rates import RateStore
 
 if TYPE_CHECKING:  # pragma: no cover - typing only: the adapter package may not be importable
     from .exchanges.base import ExchangeAdapter
 
-__all__ = ["AdStore", "AdPublisher", "build_ad_spec"]
+__all__ = ["AdStore", "AdPublisher"]
 
 _log = get_logger(__name__)
 
@@ -126,8 +122,9 @@ class AdStore:
     def load(cls, path: str | Path | None) -> "AdStore":
         """Read ``path``; a missing or corrupt file degrades to an empty store.
 
-        The ledger is a cache of what we published: losing it costs a duplicate-create, so
-        a damaged file must never stop the bot. Every failure is logged and swallowed.
+        The ledger is a cache of what we manage: losing it means the ads must be linked
+        again (``edit_ad(adv_no=...)``), so a damaged file must never stop the bot. Every
+        failure is logged and swallowed.
         """
         store = cls(path=path)
         if path is None:
@@ -167,79 +164,14 @@ class AdStore:
             self.put(record)
 
 
-def _resolve_plan(source: Blueprint | PairPlan | None, pair: Pair) -> PairPlan | None:
-    """The pair plan inside ``source`` for ``pair``, or ``None`` when there is none."""
-    if source is None:
-        return None
-    if isinstance(source, Blueprint):
-        for plan in source.pairs:
-            if plan.pair == pair:
-                return plan
-        raise ConfigError(
-            f"blueprint {source.name!r} has no pair {pair.symbol}; "
-            f"known pairs: {', '.join(plan.pair.symbol for plan in source.pairs) or 'none'}"
-        )
-    if getattr(source, "pair", None) == pair:
-        return source
-    raise ConfigError(f"pair plan is for {source.pair.symbol}, not {pair.symbol}")
-
-
-def build_ad_spec(
-    computed: ComputedAd,
-    blueprint_or_plan: Blueprint | PairPlan | None = None,
-    *,
-    price: Decimal | None = None,
-    active: bool | None = None,
-) -> AdSpec:
-    """Build the venue-facing :class:`~p2pbot.models.AdSpec` for ``computed``.
-
-    Args:
-        computed: the price the engine decided to advertise.
-        blueprint_or_plan: the active blueprint (the plan of ``computed.pair`` is looked
-            up) or that plan itself; ``None`` falls back to the blueprint-level amount
-            defaults, which is only sensible when no scenario is known.
-        price: price to publish instead of ``computed.price`` (the publisher passes the
-            cap-re-asserted price).
-        active: ``True``/``False`` to force the ad on/off; ``None`` keeps the plan's
-            ``enabled`` flag.
-
-    Payment methods and amount bounds come from the plan; the side is always ``sell``.
-    """
-    pair = Pair.parse(computed.pair)
-    plan = _resolve_plan(blueprint_or_plan, pair)
-    if plan is None:
-        min_amount = DEFAULT_MIN_AMOUNT
-        max_amount = DEFAULT_MAX_AMOUNT
-        payment_methods: tuple[str, ...] = ()
-        default_active = True
-    else:
-        min_amount = plan.min_amount
-        max_amount = plan.max_amount
-        payment_methods = tuple(plan.payment_methods)
-        default_active = bool(getattr(plan, "enabled", True))
-    return AdSpec(
-        pair=pair,
-        price=computed.price if price is None else price,
-        min_amount=min_amount,
-        max_amount=max_amount,
-        payment_methods=payment_methods,
-        active=default_active if active is None else bool(active),
-        side=SIDE_SELL,
-    )
-
-
 class AdPublisher:
-    """Create or update the advertisements of every account of every computed price.
+    """Read the live advertisements and edit existing buy ads.
 
     Args:
         adapters: venue adapters keyed by platform (``binance``/``okx``/``bybit``).
         settings: configuration used to resolve an account id into its credentials.
-        store: ledger of the advertisements we own, so a rerun updates instead of creates.
-        rates: rate store; its ``cap_rate`` is re-asserted for every advertisement.
-        dry_run: default for :meth:`publish` when the call does not decide itself.
-        plans: the active blueprint (or a single pair plan) supplying the amount bounds and
-            payment methods of the ad specs; :meth:`set_blueprint` replaces it later, e.g.
-            when the operator switches scenario.
+        store: ledger of the advertisements we manage (``edit_ad`` finds a pair's ad there).
+        dry_run: default for :meth:`edit_ad` when the call does not decide itself.
     """
 
     def __init__(
@@ -247,172 +179,331 @@ class AdPublisher:
         adapters: Mapping[str, "ExchangeAdapter"],
         settings: Settings,
         store: AdStore,
-        rates: RateStore,
         dry_run: bool = False,
-        *,
-        plans: Blueprint | PairPlan | None = None,
     ) -> None:
         self.adapters: dict[str, "ExchangeAdapter"] = {
             str(name).strip().lower(): adapter for name, adapter in adapters.items()
         }
         self.settings = settings
         self.store = store
-        self.rates = rates
         self.dry_run = bool(dry_run)
-        self.plans: Blueprint | PairPlan | None = plans
+        #: exchanges switched off with ``DISABLED_EXCHANGES``: never read, never edited
+        self.disabled_platforms: frozenset[str] = frozenset(
+            getattr(settings, "disabled_platforms", frozenset())
+        )
         self._sessions: set[str] = set()
         self._session_failures: dict[str, str] = {}
         self._dirty = False
 
-    # -- configuration -------------------------------------------------------------
-    def set_blueprint(self, blueprint: Blueprint | PairPlan | None) -> None:
-        """Attach the scenario whose pair plans describe the advertisements to publish."""
-        self.plans = blueprint
-
-    def plan_for(self, pair: Pair | str) -> PairPlan | None:
-        """The pair plan describing ``pair``, or ``None`` when no scenario is attached."""
-        return _resolve_plan(self.plans, Pair.parse(pair))
-
-    # -- publishing ----------------------------------------------------------------
-    def publish(
+    # -- editing -------------------------------------------------------------------
+    def edit_ad(
         self,
-        ads: Sequence[ComputedAd],
+        account_id: str,
+        pair: Pair | str,
+        adv_no: str | None = None,
         *,
-        dry_run: bool | None = None,
+        price: Decimal | str | int | None = None,
+        price_floating_ratio: Decimal | str | int | None = None,
+        min_amount: Decimal | str | int | None = None,
+        max_amount: Decimal | str | int | None = None,
+        quantity: Decimal | str | int | None = None,
+        payment_methods: Sequence[str] | None = None,
         active: bool | None = None,
-        create_missing: bool = True,
-    ) -> tuple[PublishResult, ...]:
-        """Push ``ads`` to every account listed on them, one result per account.
+        dry_run: bool | None = None,
+    ) -> PublishResult:
+        """Change only the given fields of one live advertisement; never creates one.
+
+        The ad is read from the venue first (:meth:`ExchangeAdapter.fetch_own_ads`), and
+        every field that is not passed keeps its live value: side, fixed price or floating
+        ratio, amounts, total quantity, payment methods and on/off state.
 
         Args:
-            ads: computed prices, in the order the engine produced them.
-            dry_run: overrides the constructor default for this call; a dry run builds no
-                request at all and persists nothing.
-            active: force the ads on/off; ``None`` keeps the blueprints' active flag.
-            create_missing: when false, an account without a remembered ``adv_no`` is
-                reported as ``skipped`` instead of being published.
+            account_id: the account owning the advertisement, e.g. ``"Binance#1"``.
+            pair: the advertised pair; it must match the live ad (a safety check).
+            adv_no: the venue advertisement id; ``None`` uses the ledger's ad for ``pair``.
+            price: new fixed price (a floating ad becomes a fixed one).
+            price_floating_ratio: new floating ratio in percent of the reference price, e.g.
+                ``91`` (Binance only; a fixed ad becomes a floating one).
+            min_amount: new minimum order amount (fiat).
+            max_amount: new maximum order amount (fiat).
+            quantity: new total crypto amount of the ad.
+            payment_methods: new payment method names.
+            active: ``True`` switches the ad on (with any other changes); ``False`` only
+                switches it off and cannot be combined with other changes.
+            dry_run: overrides the constructor default; the ad is still read, but nothing
+                is sent or stored.
 
-        Per-account faults (``ExchangeError``, an unknown account, a missing adapter) are
-        captured into that account's result; other accounts continue. The ledger is written
-        once at the end, and only when an advertisement was actually created or updated - a
-        dry run therefore leaves the state on disk untouched.
+        Only **buy** ads are handled: a sell ad is refused untouched.
+
+        Refused (as a ``status="error"`` result, never raised): a sell, missing, closed or
+        mismatched ad; both ``price`` and ``price_floating_ratio``; changes to an offline
+        ad without ``active=True``.
         """
         effective_dry_run = self.dry_run if dry_run is None else bool(dry_run)
+        pair = Pair.parse(pair)
         self._sessions.clear()
         self._session_failures.clear()
         self._dirty = False
-        results: list[PublishResult] = []
-        published: set[tuple[str, str]] = set()
-        for computed in ads:
-            pair = Pair.parse(computed.pair)
-            plan = self.plan_for(pair)
-            if plan is None:
-                _log.warning(
-                    "no pair plan for %s: publishing with the default amount bounds", pair.symbol
-                )
-            price = self._capped_price(computed, pair)
-            spec = build_ad_spec(computed, plan, price=price, active=active)
-            for account_id in computed.accounts:
-                # same canonicalisation as the ledger key, so "Binance#1" and "binance#1"
-                # are recognised as one account and published exactly once
-                key = _record_key(account_id, pair)
-                if key in published:
-                    _log.warning("duplicate account %s for %s skipped", key[0], pair.symbol)
-                    continue
-                published.add(key)
-                results.append(
-                    self._publish_account(
-                        computed, pair, account_id, spec, effective_dry_run, create_missing
-                    )
-                )
-        if self._dirty:
-            self.store.save()
-        return tuple(results)
 
-    # -- internals -----------------------------------------------------------------
-    def _capped_price(self, computed: ComputedAd, pair: Pair) -> Decimal:
-        """The price actually pushed: never above the stored (or computed) ceiling."""
-        cap = self.rates.cap(pair)
-        if cap is None:
-            cap = computed.cap
-        price: Decimal = computed.price
-        if cap is not None and price > cap:
-            _log.warning(
-                "cap re-asserted for %s on %s: %s clamped to %s",
-                pair.symbol,
-                computed.platform,
-                price,
-                cap,
+        def failed(
+            message: str,
+            *,
+            account: str = str(account_id),
+            platform: str = "",
+            edit_price: Decimal | None = None,
+        ) -> PublishResult:
+            _log.warning("edit %s %s refused: %s", account, pair.symbol, message)
+            return PublishResult(
+                account_id=account,
+                platform=platform,
+                pair=pair,
+                status="error",
+                price=edit_price,
+                adv_no=adv_no,
+                error=message,
+                dry_run=effective_dry_run,
             )
-            price = cap
-        return price
 
-    def _publish_account(
-        self,
-        computed: ComputedAd,
-        pair: Pair,
-        account_id: str,
-        spec: AdSpec,
-        dry_run: bool,
-        create_missing: bool,
-    ) -> PublishResult:
-        """One create/update attempt for one account; never raises for a venue fault."""
         try:
             account = self.settings.account(account_id)
         except ConfigError as exc:
-            _log.warning("account %s is not configured: %s", account_id, exc)
-            return PublishResult(
-                account_id=str(account_id),
-                platform=computed.platform,
-                pair=pair,
-                status="error",
-                price=spec.price,
-                error=str(exc),
-                dry_run=dry_run,
+            return failed(str(exc))
+        platform = account.platform
+        if platform in self.disabled_platforms:
+            return failed(
+                f"{platform} is disabled (DISABLED_EXCHANGES)", platform=platform, account=account.id
+            )
+        adapter = self.adapters.get(platform)
+        if adapter is None:
+            return failed(
+                f"no adapter registered for platform {platform!r}",
+                platform=platform,
+                account=account.id,
+            )
+        record = self.store.get(account.id, pair)
+        adv_no = adv_no or (record.adv_no if record is not None else None)
+        if not adv_no:
+            return failed(
+                f"no advertisement on record for {account.id} {pair.symbol}; pass adv_no",
+                platform=platform,
+                account=account.id,
             )
 
-        existing = self.store.get(account.id, pair)
-        adv_no = existing.adv_no if existing is not None else None
-        if dry_run:
+        try:
+            live_ads = adapter.fetch_own_ads(account)
+        except ExchangeError as exc:
+            return failed(
+                f"cannot read the advertisement: {type(exc).__name__}: {exc}",
+                platform=platform,
+                account=account.id,
+            )
+        live = next((ad for ad in live_ads if ad.adv_no == adv_no), None)
+        try:
+            if live is None:
+                raise ConfigError(f"{account.id} has no advertisement {adv_no}")
+            if live.pair != pair:
+                raise ConfigError(f"advertisement {adv_no} is {live.pair.symbol}, not {pair.symbol}")
+            if live.status == AD_STATUS_CLOSED:
+                raise ConfigError(f"advertisement {adv_no} is closed")
+            if live.side != SIDE_BUY:
+                raise ConfigError(
+                    f"advertisement {adv_no} is a {live.side or 'side-less'} ad; only buy ads "
+                    "are handled"
+                )
+            spec = self._edited_spec(
+                live,
+                price=price,
+                price_floating_ratio=price_floating_ratio,
+                min_amount=min_amount,
+                max_amount=max_amount,
+                quantity=quantity,
+                payment_methods=payment_methods,
+                active=active,
+            )
+        except ConfigError as exc:
+            return failed(str(exc), platform=platform, account=account.id)
+
+        if effective_dry_run:
             return PublishResult(
                 account_id=account.id,
-                platform=computed.platform,
+                platform=platform,
                 pair=pair,
                 status="dry_run",
                 price=spec.price,
                 adv_no=adv_no,
                 dry_run=True,
             )
-        if adv_no is None and not create_missing:
-            _log.info("skipped %s %s: no advertisement on record", account.id, pair.symbol)
-            return PublishResult(
-                account_id=account.id,
-                platform=computed.platform,
-                pair=pair,
-                status="skipped",
-                price=spec.price,
-                dry_run=False,
-            )
+        # remember the ad only when the ledger has none for this pair (or has this one)
+        remember = record is None or record.adv_no == adv_no
+        result = self._push(adapter, account, platform, pair, spec, adv_no, remember=remember)
+        if self._dirty:
+            self.store.save()
+        return result
 
-        adapter = self.adapters.get(str(computed.platform).strip().lower())
-        if adapter is None:
-            message = f"no adapter registered for platform {computed.platform!r}"
-            _log.warning("%s: %s", account.id, message)
-            return PublishResult(
-                account_id=account.id,
-                platform=computed.platform,
-                pair=pair,
-                status="error",
-                price=spec.price,
-                adv_no=adv_no,
-                error=message,
+    def _edited_spec(
+        self,
+        live: OwnAd,
+        *,
+        price: Decimal | str | int | None,
+        price_floating_ratio: Decimal | str | int | None,
+        min_amount: Decimal | str | int | None,
+        max_amount: Decimal | str | int | None,
+        quantity: Decimal | str | int | None,
+        payment_methods: Sequence[str] | None,
+        active: bool | None,
+    ) -> AdSpec:
+        """The live ad with the requested changes applied; raises ``ConfigError`` to refuse."""
+        changes = [
+            value
+            for value in (price, price_floating_ratio, min_amount, max_amount, quantity, payment_methods)
+            if value is not None
+        ]
+        if active is False and changes:
+            raise ConfigError("active=False only switches the ad off; change other fields separately")
+        if active is None and not changes:
+            raise ConfigError("nothing to change")
+        if active is None and not live.active:
+            raise ConfigError(
+                f"advertisement {live.adv_no} is {live.status}; pass active=True to update it and "
+                "bring it online"
             )
+        if price is not None and price_floating_ratio is not None:
+            raise ConfigError("pass either price or price_floating_ratio, not both")
 
+        ratio = live.price_floating_ratio
+        if price is not None:
+            new_price = parse_decimal(price, "price")
+            ratio = None
+        elif price_floating_ratio is not None:
+            ratio = parse_decimal(price_floating_ratio, "price_floating_ratio")
+            if ratio <= 0:
+                raise ConfigError(f"price_floating_ratio must be positive, got {ratio}")
+            if live.price is None or live.price_floating_ratio is None:
+                raise ConfigError(
+                    f"advertisement {live.adv_no} has no floating price to rescale; its new price "
+                    "cannot be estimated"
+                )
+            # informational: the venue prices a floating ad from its reference price
+            new_price = live.price * ratio / live.price_floating_ratio
+        elif live.price is not None:
+            new_price = live.price
+        else:
+            raise ConfigError(f"the venue reports no price for advertisement {live.adv_no}")
+        if new_price <= 0:
+            raise ConfigError(f"price must be positive, got {new_price}")
+
+        low = parse_decimal(min_amount, "min_amount") if min_amount is not None else live.min_amount
+        high = parse_decimal(max_amount, "max_amount") if max_amount is not None else live.max_amount
+        total = parse_decimal(quantity, "quantity") if quantity is not None else live.total_quantity
+        if low is None or high is None:
+            raise ConfigError(f"the venue reports no order limits for {live.adv_no}; pass both")
+        if total is None:
+            raise ConfigError(f"the venue reports no quantity for {live.adv_no}; pass quantity")
+        if low <= 0:
+            raise ConfigError(f"min_amount must be positive, got {low}")
+        if high < low:
+            raise ConfigError(f"max_amount {high} is below min_amount {low}")
+        if total <= 0:
+            raise ConfigError(f"quantity must be positive, got {total}")
+
+        if payment_methods is not None:
+            methods, payment_ids = tuple(str(method) for method in payment_methods), ()
+        else:
+            methods, payment_ids = (), live.payment_ids
+        return AdSpec(
+            pair=live.pair,
+            price=new_price,
+            min_amount=low,
+            max_amount=high,
+            payment_methods=methods,
+            active=live.active if active is None else bool(active),
+            side=live.side,
+            quantity=total,
+            payment_ids=payment_ids,
+            price_floating_ratio=ratio,
+        )
+
+    # -- reading ---------------------------------------------------------------------
+    def fetch_own_ads(
+        self,
+        account_ids: Sequence[str] | None = None,
+        *,
+        include_closed: bool = False,
+    ) -> tuple[OwnAdsResult, ...]:
+        """Every advertisement currently in the venue profiles, online and offline alike.
+
+        Args:
+            account_ids: accounts to read, e.g. ``["Binance#1"]``; ``None`` reads every
+                configured account, ordered by platform then index.
+            include_closed: also list ads the venue reports as closed/completed.
+
+        This reads the venues, not the local ledger, so it also shows ads created by hand.
+        Nothing is changed or stored. One result per account: a failing account (unknown,
+        no adapter, a venue error) carries ``error`` and the others are still read. Accounts
+        of an exchange in ``DISABLED_EXCHANGES`` are skipped (no result at all).
+        """
+        if account_ids is None:
+            account_ids = [
+                account.id
+                for platform in PLATFORMS
+                if platform not in self.disabled_platforms
+                for account in self.settings.accounts_for(platform)
+            ]
+        results: list[OwnAdsResult] = []
+        for account_id in account_ids:
+            try:
+                account = self.settings.account(account_id)
+            except ConfigError as exc:
+                results.append(OwnAdsResult(account_id=str(account_id), platform="", error=str(exc)))
+                continue
+            if account.platform in self.disabled_platforms:
+                _log.debug("skipped %s: %s is disabled", account.id, account.platform)
+                continue
+            adapter = self.adapters.get(account.platform)
+            if adapter is None:
+                results.append(
+                    OwnAdsResult(
+                        account_id=account.id,
+                        platform=account.platform,
+                        error=f"no adapter registered for platform {account.platform!r}",
+                    )
+                )
+                continue
+            try:
+                ads = adapter.fetch_own_ads(account)
+            except ExchangeError as exc:
+                _log.warning("listing the ads of %s failed: %s", account.id, exc)
+                results.append(
+                    OwnAdsResult(
+                        account_id=account.id,
+                        platform=account.platform,
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
+                )
+                continue
+            if not include_closed:
+                ads = tuple(ad for ad in ads if ad.status != AD_STATUS_CLOSED)
+            results.append(OwnAdsResult(account_id=account.id, platform=account.platform, ads=ads))
+        return tuple(results)
+
+    # -- internals -----------------------------------------------------------------
+    def _push(
+        self,
+        adapter: "ExchangeAdapter",
+        account: Any,
+        platform: str,
+        pair: Pair,
+        spec: AdSpec,
+        adv_no: str,
+        *,
+        remember: bool = True,
+    ) -> PublishResult:
+        """Send one update request and (unless ``remember`` is false) record the outcome."""
         failure = self._session_failures.get(account.id)
         if failure is not None:
             return PublishResult(
                 account_id=account.id,
-                platform=computed.platform,
+                platform=platform,
                 pair=pair,
                 status="error",
                 price=spec.price,
@@ -422,24 +513,18 @@ class AdPublisher:
 
         try:
             self._ensure_session(adapter, account)
-            created = not adv_no
-            status = "created" if created else "updated"
-            if created:
-                request = adapter.build_create_ad_request(account, spec)
-            else:
-                request = adapter.build_update_ad_request(account, spec, adv_no)
+            request = adapter.build_update_ad_request(account, spec, adv_no)
             action = adapter.parse_ad_result(
                 adapter.send_private(account, request),
                 account=account,
                 pair=pair,
                 spec=spec,
-                created=created,
             )
         except ExchangeError as exc:
             _log.warning("%s %s failed: %s", account.id, pair.symbol, exc)
             return PublishResult(
                 account_id=account.id,
-                platform=computed.platform,
+                platform=platform,
                 pair=pair,
                 status="error",
                 price=spec.price,
@@ -448,26 +533,24 @@ class AdPublisher:
             )
 
         stored_adv_no = action.adv_no or adv_no
-        self.store.put(
-            AdRecord(
-                account_id=account.id,
-                pair=pair,
-                adv_no=stored_adv_no,
-                price=spec.price,
-                active=spec.active,
-                updated_at=utcnow(),
+        if remember:
+            self.store.put(
+                AdRecord(
+                    account_id=account.id,
+                    pair=pair,
+                    adv_no=stored_adv_no,
+                    price=spec.price,
+                    active=spec.active,
+                    updated_at=utcnow(),
+                )
             )
-        )
-        self._dirty = True
-        _log.info(
-            "%s %s %s at %s%s", status, account.id, pair.symbol, spec.price,
-            f" (adv {stored_adv_no})" if stored_adv_no else "",
-        )
+            self._dirty = True
+        _log.info("updated %s %s at %s (adv %s)", account.id, pair.symbol, spec.price, stored_adv_no)
         return PublishResult(
             account_id=account.id,
-            platform=computed.platform,
+            platform=platform,
             pair=pair,
-            status=status,
+            status="updated",
             price=spec.price,
             adv_no=stored_adv_no,
         )
