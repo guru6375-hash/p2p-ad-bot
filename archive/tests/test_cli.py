@@ -1,0 +1,538 @@
+"""CLI: every subcommand, --scenario/--dry-run, output format and exit codes (SPEC 12)."""
+
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+from datetime import datetime, timezone
+from decimal import Decimal
+from pathlib import Path
+
+import pytest
+
+from p2pbot.blueprint import Blueprint, load_blueprint, load_blueprint_by_name, parse_blueprint
+from p2pbot.cli import build_parser, main
+from p2pbot.constants import TELEGRAM_COMMANDS
+from p2pbot.errors import ConfigError, ExchangeError, MissingCapError, TransportError
+from p2pbot.market import MarketFetchResult, MarketStore, build_snapshot
+from p2pbot.models import ComputedAd, Pair
+from p2pbot.scheduler import Job, Scheduler
+
+from conftest import BASE_RATE_SCENARIO, base_rate_scenario_data, write_base_rate_scenario
+
+SCENARIOS = Path(__file__).resolve().parents[1] / "scenarios"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+UTC = timezone.utc
+
+
+def _computed(
+    *,
+    pair: str = "PLN/USDT",
+    platform: str = "binance",
+    price: str = "3.85",
+    source: str = "market_middle",
+    clamped: bool = False,
+) -> ComputedAd:
+    return ComputedAd(
+        pair=Pair.parse(pair),
+        platform=platform,
+        price=Decimal(price),
+        source=source,
+        cap=Decimal("3.90"),
+        accounts=("Binance#1",),
+        clamped=clamped,
+    )
+
+
+class _StubAdapter:
+    def __init__(self, platform: str, ads=()) -> None:
+        self.platform = platform
+        self.ads = tuple(ads)
+
+    def search_ads(self, pair, *, filters=None, **kwargs):
+        return build_snapshot(self.platform, pair, self.ads, filters)
+
+
+class _FakeScenarios:
+    def __init__(self, blueprint: Blueprint | None) -> None:
+        self._blueprint = blueprint
+        self.activated: list[str] = []
+
+    def available(self) -> tuple[str, ...]:
+        return ("pln",)
+
+    def active_name(self) -> str | None:
+        return None if self._blueprint is None else self._blueprint.name
+
+    def activate(self, name: str) -> Blueprint:
+        blueprint = load_blueprint_by_name(name, SCENARIOS)
+        self.activated.append(name)
+        self._blueprint = blueprint
+        return blueprint
+
+    def blueprint(self) -> Blueprint:
+        if self._blueprint is None:
+            raise ConfigError("no active scenario; available: pln")
+        return self._blueprint
+
+    def reload(self) -> Blueprint:
+        return self.blueprint()
+
+
+class FakeFacade:
+    """Duck-typed stand-in for ``BotServices`` covering everything the CLI touches."""
+
+    def __init__(
+        self,
+        blueprint: Blueprint | None,
+        *,
+        ads: tuple[ComputedAd, ...] = (),
+        parser_rows: tuple[MarketFetchResult, ...] = (),
+        clock: datetime | None = None,
+        scheduler=None,
+    ) -> None:
+        self.scenarios = _FakeScenarios(blueprint)
+        self.scheduler = scheduler or Scheduler(lambda: clock or datetime(2026, 1, 1, tzinfo=UTC))
+        self.clock = lambda: clock or datetime(2026, 1, 1, tzinfo=UTC)
+        self.adapters = {
+            "binance": _StubAdapter("binance"),
+            "okx": _StubAdapter("okx", ads=()),
+            "bybit": _StubAdapter("bybit", ads=()),
+        }
+        self.market = MarketStore()
+        self.publisher = None
+        self.ads = ads
+        self.parser_rows = parser_rows
+        self.compute_error: BaseException | None = None
+        self.parser_error: BaseException | None = None
+        self.compute_calls = 0
+
+    @property
+    def scenario_name(self) -> str | None:
+        return self.scenarios._blueprint.name if self.scenarios._blueprint else None
+
+    def compute(self) -> tuple[ComputedAd, ...]:
+        self.compute_calls += 1
+        if self.compute_error is not None:
+            raise self.compute_error
+        return self.ads
+
+    def run_parser(self, pairs=None):
+        if self.parser_error is not None:
+            raise self.parser_error
+        return self.parser_rows
+
+
+def _env(tmp_path: Path, **overrides) -> dict[str, str]:
+    env = {
+        "TELEGRAM_BOT_TOKEN": "123456:TEST-TOKEN",
+        "TELEGRAM_OWNER_ID": "4242",
+        "STATE_PATH": str(tmp_path / "var" / "state.json"),
+        "MARKET_PATH": str(tmp_path / "var" / "market.json"),
+        "ADS_PATH": str(tmp_path / "var" / "ads.json"),
+        "SCENARIOS_DIR": str(SCENARIOS),
+        "LOG_PATH": "",
+        "BINANCE_1_API_KEY": "k1",
+        "BINANCE_1_SECRET_KEY": "s1",
+        "BINANCE_2_API_KEY": "k2",
+        "BINANCE_2_SECRET_KEY": "s2",
+        "OKX_1_API_KEY": "ok",
+        "OKX_1_SECRET_KEY": "os",
+        "OKX_1_PASSPHRASE": "op",
+        "BYBIT_1_API_KEY": "bk",
+        "BYBIT_1_SECRET_KEY": "bs",
+    }
+    env.update({key.upper(): str(value) for key, value in overrides.items()})
+    return env
+
+
+def _scenarios_copy(tmp_path: Path) -> Path:
+    target = tmp_path / "scenarios"
+    target.mkdir()
+    (target / "pln.json").write_text((SCENARIOS / "pln.json").read_text(encoding="utf-8"), encoding="utf-8")
+    write_base_rate_scenario(target)
+    return target
+
+
+def _base_rate_blueprint() -> Blueprint:
+    return parse_blueprint(base_rate_scenario_data())
+
+
+# -- argument parsing ------------------------------------------------------------------
+def test_parser_exposes_every_documented_command() -> None:
+    for name in ("bot", "parser", "rates", "pln-edits", "verify-config"):
+        assert build_parser().parse_args([name]).command == name
+    assert build_parser().parse_args(["rates", "--scenario", "pln"]).scenario == "pln"
+    assert build_parser().parse_args(["rates"]).scenario is None
+    assert build_parser().parse_args(["pln-edits"]).dry_run is False
+    assert build_parser().parse_args(["pln-edits", "--dry-run"]).dry_run is True
+    for removed in ("publish", "tick"):
+        with pytest.raises(SystemExit):
+            build_parser().parse_args([removed])
+
+
+def test_missing_or_unknown_command_exits_two(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main([], env={}) == 2
+    assert main(["nope"], env={}) == 2
+    assert main(["--version"], env={}) == 0
+    assert main(["--help"], env={}) == 0
+    captured = capsys.readouterr()
+    assert "p2p-ad-bot" in captured.out
+
+
+# -- rates -----------------------------------------------------------------------------
+def test_rates_prints_the_computed_prices(capsys: pytest.CaptureFixture[str], tmp_path: Path) -> None:
+    facade = FakeFacade(
+        load_blueprint(SCENARIOS / "pln.json"),
+        ads=(
+            _computed(price="3.85"),
+            _computed(pair="PLN/USDC", platform="bybit", price="3.84", source="copy:Binance"),
+            _computed(platform="okx", pair="PLN/USDC", price="3.90", clamped=True),
+        ),
+    )
+    assert main(["rates"], env=_env(tmp_path), services=facade) == 0
+    out = capsys.readouterr().out.splitlines()
+    assert out[0] == "scenario pln (PLN, market_middle)"
+    assert out[1] == "PLN/USDT Binance 3.85 market_middle"
+    assert out[2] == "PLN/USDC ByBit 3.84 copy:Binance"
+    assert out[3] == "PLN/USDC OKX 3.90 market_middle [clamped]"
+
+
+def test_rates_without_prices(capsys: pytest.CaptureFixture[str], tmp_path: Path) -> None:
+    facade = FakeFacade(load_blueprint(SCENARIOS / "pln.json"))
+    assert main(["rates"], env=_env(tmp_path), services=facade) == 0
+    assert capsys.readouterr().out.splitlines()[-1] == "no prices computed"
+
+
+def test_rates_activates_the_requested_scenario(tmp_path: Path) -> None:
+    facade = FakeFacade(_base_rate_blueprint())
+    assert main(["rates", "--scenario", "pln"], env=_env(tmp_path), services=facade) == 0
+    assert facade.scenarios.activated == ["pln"]
+    assert facade.scenario_name == "pln"
+
+
+def test_a_configuration_fault_exits_one(capsys: pytest.CaptureFixture[str], tmp_path: Path) -> None:
+    facade = FakeFacade(load_blueprint(SCENARIOS / "pln.json"))
+    facade.compute_error = MissingCapError("no cap_rate stored for PLN/USDT")
+    assert main(["rates"], env=_env(tmp_path), services=facade) == 1
+    assert "error: no cap_rate stored for PLN/USDT" in capsys.readouterr().err
+
+
+def test_a_runtime_fault_exits_two(capsys: pytest.CaptureFixture[str], tmp_path: Path) -> None:
+    facade = FakeFacade(load_blueprint(SCENARIOS / "pln.json"))
+    facade.compute_error = ExchangeError("venue exploded")
+    assert main(["rates"], env=_env(tmp_path), services=facade) == 2
+    assert "error: ExchangeError: venue exploded" in capsys.readouterr().err
+
+    unexpected = FakeFacade(load_blueprint(SCENARIOS / "pln.json"))
+    unexpected.compute_error = RuntimeError("boom")
+    assert main(["rates"], env=_env(tmp_path), services=unexpected) == 2
+    assert "error: RuntimeError: boom" in capsys.readouterr().err
+
+
+def test_no_active_scenario_is_a_configuration_fault(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    facade = FakeFacade(None)
+    assert main(["rates"], env=_env(tmp_path), services=facade) == 1
+    assert "no active scenario" in capsys.readouterr().err
+
+
+def test_a_scenario_alignment_leaves_the_parser_job_scheduled(tmp_path: Path) -> None:
+    facade = FakeFacade(load_blueprint(SCENARIOS / "pln.json"), clock=datetime(2026, 1, 1, tzinfo=UTC))
+    facade.scheduler.add(Job.every("parser", lambda: None, 25))
+    facade.market.put(build_snapshot("binance", Pair.parse("PLN/USDT"), (), None))
+    assert main(["parser", "--scenario", "pln"], env=_env(tmp_path), services=facade) == 0
+    job = facade.scheduler.get("parser")
+    assert job.next_run_at is not None
+
+
+# -- parser ----------------------------------------------------------------------------
+def test_parser_prints_each_venue(capsys: pytest.CaptureFixture[str], tmp_path: Path) -> None:
+    facade = FakeFacade(
+        load_blueprint(SCENARIOS / "pln.json"),
+        parser_rows=(
+            MarketFetchResult(
+                platform="binance",
+                pair=Pair.parse("PLN/USDT"),
+                fetched=3,
+                kept=1,
+                middle=Decimal("3.84"),
+            ),
+            MarketFetchResult(
+                platform="okx", pair=Pair.parse("PLN/USDC"), error="ApiError: no ads"
+            ),
+        ),
+    )
+    assert main(["parser"], env=_env(tmp_path), services=facade) == 0
+    out = capsys.readouterr().out.splitlines()
+    assert out[0] == "Binance PLN/USDT fetched=3 kept=1 middle=3.84"
+    assert out[1] == "OKX PLN/USDC fetched=0 kept=0 middle=- error=ApiError: no ads"
+
+
+def test_parser_without_targets(capsys: pytest.CaptureFixture[str], tmp_path: Path) -> None:
+    facade = FakeFacade(_base_rate_blueprint())
+    assert main(["parser"], env=_env(tmp_path), services=facade) == 0
+    assert capsys.readouterr().out.splitlines() == ["no market prices to fetch for this scenario"]
+
+
+def test_parser_dry_run_keeps_the_market_store_untouched(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    from p2pbot.models import Pair as _Pair
+
+    facade = FakeFacade(load_blueprint(SCENARIOS / "pln.json"))
+    facade.market.put(
+        build_snapshot("binance", _Pair.parse("PLN/USDT"), [], fetched_at=datetime(2026, 1, 1, tzinfo=UTC))
+    )
+    before = facade.market.as_dict()
+
+    assert main(["parser", "--dry-run"], env=_env(tmp_path), services=facade) == 0
+
+    assert facade.market.as_dict() == before  # scratch store only
+    out = capsys.readouterr().out.splitlines()
+    assert len(out) == 4
+    assert all("fetched=0 kept=0 middle=-" in line for line in out)
+    assert out[0].startswith("Binance PLN/USDT")
+
+
+def test_parser_reports_a_transport_failure(capsys: pytest.CaptureFixture[str], tmp_path: Path) -> None:
+    facade = FakeFacade(load_blueprint(SCENARIOS / "pln.json"))
+    facade.parser_error = TransportError("dns failure")
+    assert main(["parser"], env=_env(tmp_path), services=facade) == 2
+    assert "error: TransportError: dns failure" in capsys.readouterr().err
+
+
+# -- verify-config ---------------------------------------------------------------------
+def test_verify_config_accepts_a_good_setup(capsys: pytest.CaptureFixture[str], tmp_path: Path) -> None:
+    scenarios = _scenarios_copy(tmp_path)
+    assert main(["verify-config"], env=_env(tmp_path, SCENARIOS_DIR=str(scenarios))) == 0
+    out = capsys.readouterr().out
+    assert "ok pln.json: pln (PLN, market_middle), 2 pair(s)" in out
+    assert "ok base_rate.json: base_rate (UAH, market_middle), 2 pair(s)" in out
+    assert "config ok: 4 account(s), 2 blueprint(s)" in out
+
+
+def test_verify_config_reports_a_broken_blueprint(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    scenarios = _scenarios_copy(tmp_path)
+    (scenarios / "broken.json").write_text("{not json", encoding="utf-8")
+    assert main(["verify-config"], env=_env(tmp_path, SCENARIOS_DIR=str(scenarios))) == 1
+    captured = capsys.readouterr()
+    assert "is not valid JSON" in captured.err
+    assert "1 problem(s) found" in captured.err
+    assert "ok pln.json" in captured.out
+
+
+def test_verify_config_reports_a_missing_scenarios_dir(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    assert main(["verify-config"], env=_env(tmp_path, SCENARIOS_DIR=str(tmp_path / "nope"))) == 1
+    assert "no blueprint files in" in capsys.readouterr().err
+
+
+def test_verify_config_reports_accounts_missing_from_env(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    scenarios = _scenarios_copy(tmp_path)
+    env = _env(tmp_path, SCENARIOS_DIR=str(scenarios))
+    for key in list(env):
+        if key.startswith("BYBIT"):
+            del env[key]
+    assert main(["verify-config"], env=env) == 1
+    err = capsys.readouterr().err
+    assert "accounts missing from .env: Bybit#1" in err
+
+
+def test_verify_config_reports_invalid_settings(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    scenarios = _scenarios_copy(tmp_path)
+    env = _env(tmp_path, SCENARIOS_DIR=str(scenarios), TELEGRAM_OWNER_ID="not-a-number")
+    assert main(["verify-config"], env=env) == 1
+    assert "TELEGRAM_OWNER_ID must be a positive integer" in capsys.readouterr().err
+
+
+def test_verify_config_does_not_need_the_façade(tmp_path: Path) -> None:
+    """No services/build_services call is made for a pure validation run."""
+    scenarios = _scenarios_copy(tmp_path)
+    assert main(["verify-config"], env=_env(tmp_path, SCENARIOS_DIR=str(scenarios))) == 0
+
+
+# -- bot -------------------------------------------------------------------------------
+def test_bot_requires_telegram_credentials(capsys: pytest.CaptureFixture[str], tmp_path: Path) -> None:
+    env = _env(tmp_path)
+    del env["TELEGRAM_BOT_TOKEN"]
+    assert main(["bot"], env=env) == 1
+    assert "TELEGRAM_BOT_TOKEN is required to run the Telegram bot" in capsys.readouterr().err
+
+    env = _env(tmp_path)
+    del env["TELEGRAM_OWNER_ID"]
+    assert main(["bot"], env=env) == 1
+    assert "TELEGRAM_OWNER_ID is required to run the Telegram bot" in capsys.readouterr().err
+
+
+def test_bot_starts_the_runner_and_attaches_the_scheduler(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from p2pbot.telegram import bot as bot_module
+
+    recorded: dict[str, object] = {}
+
+    class _FakeRunner:
+        def __init__(self, services, api):
+            recorded["services"] = services
+            recorded["api"] = api
+
+        def attach_scheduler(self, scheduler) -> None:
+            recorded["scheduler"] = scheduler
+
+        def register_commands(self) -> bool:
+            recorded["registered"] = True
+            return True
+
+        def run_forever(self, **kwargs) -> int:
+            recorded["ran"] = True
+            return 0
+
+    monkeypatch.setattr(bot_module, "BotRunner", _FakeRunner)
+    facade = FakeFacade(load_blueprint(SCENARIOS / "pln.json"))
+    # LOG_LEVEL is unknown, so validate() reports a warning the bot path must log
+    assert main(["bot"], env=_env(tmp_path, LOG_LEVEL="LOUD"), services=facade) == 0
+    out = capsys.readouterr().out.splitlines()
+    assert out == [
+        "bot: scenario pln (market_middle), polling https://api.telegram.org",
+        f"bot: command menu published ({len(TELEGRAM_COMMANDS)} commands)",
+    ]
+    assert recorded["registered"] is True  # the "/" menu is published before polling
+    assert recorded["ran"] is True
+    assert recorded["scheduler"] is facade.scheduler
+    assert recorded["services"] is facade
+
+
+def test_bot_stops_cleanly_on_keyboard_interrupt(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from p2pbot.telegram import bot as bot_module
+
+    class _InterruptingRunner:
+        def __init__(self, services, api) -> None:
+            pass
+
+        def attach_scheduler(self, scheduler) -> None:
+            pass
+
+        def run_forever(self, **kwargs) -> int:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(bot_module, "BotRunner", _InterruptingRunner)
+    facade = FakeFacade(load_blueprint(SCENARIOS / "pln.json"))
+    assert main(["bot"], env=_env(tmp_path), services=facade) == 0
+    assert capsys.readouterr().out.splitlines()[-1] == "bot: stopped"
+
+
+# -- run.py ----------------------------------------------------------------------------
+def test_run_py_entrypoint_reports_the_version() -> None:
+    completed = subprocess.run(
+        [sys.executable, "run.py", "--version"],
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert completed.returncode == 0
+    assert "p2p-ad-bot" in (completed.stdout + completed.stderr)
+
+
+def test_run_py_entrypoint_rejects_an_unknown_command() -> None:
+    completed = subprocess.run(
+        [sys.executable, "run.py", "nope"],
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert completed.returncode == 2
+    assert "invalid choice" in (completed.stderr + completed.stdout)
+
+
+def test_env_mapping_is_honoured_instead_of_the_dotenv_file(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """An explicit ``env`` mapping is used verbatim: no ``.env`` file is read."""
+    scenarios = tmp_path / "scenarios"
+    scenarios.mkdir()
+    (scenarios / "bare.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "name": "bare",
+                "fiat": "PLN",
+                "strategy": "market_middle",
+                "pairs": [
+                    {"pair": "PLN/USDT", "anchor": True},
+                    {"pair": "PLN/USDC", "anchor": False, "linked_to": "PLN/USDT"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    env = {
+        "SCENARIOS_DIR": str(scenarios),
+        "LOG_PATH": "",
+        "TELEGRAM_BOT_TOKEN": "123456:TEST-TOKEN",
+        "TELEGRAM_OWNER_ID": "4242",
+    }
+    assert main(["verify-config"], env=env) == 0
+    out = capsys.readouterr().out
+    assert "ok cron_config.py: every 25 min, pairs PLN/USDT, PLN/USDC" in out
+    assert "config ok: 0 account(s), 1 blueprint(s)" in out
+
+
+# -- wiring without an injected façade -------------------------------------------------
+def test_rates_builds_the_real_façade_when_none_is_injected(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """No injected services -> the CLI wires build_services itself (no venue call)."""
+    scenarios = _scenarios_copy(tmp_path)
+    env = _env(tmp_path, SCENARIOS_DIR=str(scenarios), SCENARIO=BASE_RATE_SCENARIO)
+    assert main(["rates"], env=env) == 1
+    err = capsys.readouterr().err
+    assert "error: no base_rate stored for UAH/USDT" in err
+
+
+def test_verify_config_reports_settings_that_raise(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    scenarios = _scenarios_copy(tmp_path)
+    env = _env(tmp_path, SCENARIOS_DIR=str(scenarios), OKX_1_SECRET_KEY="", OKX_1_PASSPHRASE="")
+    assert main(["verify-config"], env=env) == 1
+    err = capsys.readouterr().err
+    assert "Okx#1 is missing required credential" in err
+    assert "problem(s) found" in err
+
+
+def test_bot_reports_a_command_menu_that_could_not_be_published(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from p2pbot.telegram import bot as bot_module
+
+    class _UnpublishedRunner:
+        def __init__(self, services, api):
+            pass
+
+        def register_commands(self) -> bool:
+            return False
+
+        def run_forever(self, **kwargs) -> int:
+            return 0
+
+    monkeypatch.setattr(bot_module, "BotRunner", _UnpublishedRunner)
+    facade = FakeFacade(load_blueprint(SCENARIOS / "pln.json"))
+
+    assert main(["bot"], env=_env(tmp_path), services=facade) == 0
+    assert capsys.readouterr().out.splitlines()[-1] == (
+        f"bot: command menu NOT published (see the log) ({len(TELEGRAM_COMMANDS)} commands)"
+    )

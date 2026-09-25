@@ -3,6 +3,16 @@
 Owner: architect. Implementers MUST follow this document exactly. Any deviation must be
 reported back, never silently introduced.
 
+> **Scope change (2026-09-25).** The bot no longer publishes scenario ads and never touches
+> sell ads. Removed: automatic publishing (`AdPublisher.publish`, `build_ad_spec`,
+> `refresh_prices`, `set_active`, the `prices` refresh job, CLI `publish`/`tick`, Telegram
+> `/publish`/`/pause`/`/resume`, and later `/parse`/`/status`/`/version`), Binance sell-ad
+> payment resolution, and the UAH `fixed_spread` scenario with `UAH_SPREAD` and
+> `base_rate_minus_spread`. Live ads are read
+> with `AdPublisher.fetch_own_ads` and existing **buy** ads are edited with
+> `AdPublisher.edit_ad`; the PLN buy ads are repriced by `p2pbot/edit_queue.py`
+> (`python run.py pln-edits`). Sections below are updated accordingly.
+
 ## 0. Hard constraints
 
 - **Runtime deps: Python standard library ONLY** (>=3.11; target 3.14 on this box).
@@ -26,7 +36,6 @@ p2p-ad-bot/
   README.md                  # operator manual
   docs/SPEC.md               # this file
   docs/research/*.md         # investigator findings per exchange (input for adapters)
-  scenarios/uah.json         # blueprint: UAH fixed-spread scenario
   scenarios/pln.json         # blueprint: PLN market-middle scenario (+ ByBit copy)
   scripts/smoke_live.py      # live public-endpoint smoke (my verification, not part of test suite)
   var/                       # runtime state (state.json, market.json, ads.json, bot.log) - gitignored
@@ -41,6 +50,7 @@ p2p-ad-bot/
     market.py
     engine.py
     publisher.py
+    edit_queue.py
     scheduler.py
     cron.py
     logging_setup.py
@@ -66,7 +76,7 @@ p2p-ad-bot/
 - `base_rate` — per-pair reference rate entered by the Telegram owner.
 - `cap_rate` — per-pair hard ceiling entered by the Telegram owner. An advertisement price
   MUST NEVER exceed it. This is enforced in `engine.quantize/clamp`, and re-asserted in
-  `publisher` before any create/update request is built (defence in depth).
+  `publisher` before any update request is built (defence in depth).
 - `anchor` — pair whose price is derived directly from `base_rate`.
 - `platform` — one of `binance`, `okx`, `bybit` (lowercase).
 - `account id` — `"Binance#1"`, `"Binance#2"`, `"Okx#1"`, `"Bybit#1"` (display form,
@@ -88,7 +98,6 @@ Keys (explicit, resolved case-insensitively from the process env / `.env` file):
 | `LOG_PATH` | optional, default `var/bot.log`; empty string = console only. |
 | `LOG_LEVEL` | optional, default `INFO`. |
 | `SCENARIO` | optional; name of the blueprint activated at startup (`/scenario` can change it later). |
-| `REFRESH_INTERVAL_MINUTES` | optional; when set to a positive integer, a `prices` scheduler job re-runs compute+publish on that cadence. Empty/absent/0 disables it. |
 
 `Settings.raw` is the **complete merged mapping** (process env overlaid on the `.env` file),
 including keys the loader does not interpret itself, so optional switches stay reachable.
@@ -125,9 +134,9 @@ A blueprint is the *custom trading scenario*. One file per scenario. Optional si
 ```jsonc
 {
   "version": 1,
-  "name": "uah",
-  "fiat": "UAH",                       // required, "UAH" | "PLN"
-  "strategy": "fixed_spread",          // "fixed_spread" | "market_middle"
+  "name": "pln",
+  "fiat": "PLN",                       // required, "UAH" | "PLN"
+  "strategy": "market_middle",         // the only strategy
   "parser": {                          // optional
     "enabled": false,                  // PLN blueprints: true
     "interval_minutes": 25,            // MUST be 25 unless explicitly overridden
@@ -166,14 +175,7 @@ A blueprint is the *custom trading scenario*. One file per scenario. Optional si
 
 ### 4.1 Source resolution (defaults when `platforms` is absent)
 
-`strategy = "fixed_spread"` (UAH):
-- anchor pair → every platform gets `source = "base_rate"`.
-- non-anchor pair → every platform gets `source = "base_rate_minus_spread"`
-  (requires `linked_to` pointing at an anchor pair; if `linked_to` omitted and fiat of the
-  pair is UAH, the loader links to the sibling anchor pair with the same fiat
-  — i.e. `UAH/USDC` links to `UAH/USDT`. Explicit `linked_to` always wins).
-
-`strategy = "market_middle"` (PLN):
+`strategy = "market_middle"` (the only strategy):
 - `binance`, `okx` → `"market_middle"`.
 - `bybit` → `"copy:Binance"`.
 
@@ -181,12 +183,9 @@ A blueprint is the *custom trading scenario*. One file per scenario. Optional si
 
 - `version` must be `1`; `fiat` in `{UAH, PLN}`; `strategy` known; `name` non-empty.
 - every `pair` parses as `FIAT/CRYPTO` and its fiat equals the blueprint fiat.
-- **`fixed_spread` spread values are hardcoded**: a pair/platform/filters block containing
-  any of the keys `spread`, `min_spread`, `spread_uah`, `diff` raises `BlueprintError`
-  ("spread for fixed_spread scenarios is hardcoded per platform").
 - `min_amount > 0`, `max_amount >= min_amount`, `price_offset` parseable Decimal.
 - each account id matches `^[A-Za-z]+#\d+$` and its platform is a known platform.
-- non-anchor pair without resolvable `linked_to` → error; `linked_to` must reference a pair
+- non-anchor pair without `linked_to` → error; `linked_to` must reference a pair
   present in the same blueprint and marked `anchor: true`.
 - `copy:<Platform>` source requires that platform's plan to exist for the same pair and to
   itself not be a `copy:` source (no copy chains).
@@ -201,8 +200,6 @@ A blueprint is the *custom trading scenario*. One file per scenario. Optional si
 ```python
 PLATFORMS = ("binance", "okx", "bybit")
 PRICE_TICK = {"UAH": Decimal("0.01"), "PLN": Decimal("0.01")}
-# UAH minimum difference between the USDT ad and the USDC ad, per platform. HARDCODED.
-UAH_SPREAD = {"binance": Decimal("0.25"), "okx": Decimal("0.01"), "bybit": Decimal("0.01")}
 DEFAULT_PARSER_INTERVAL_MINUTES = 25
 BINANCE_FILTERS = Filters(user_type="merchant", min_month_order_count=Decimal("500"),
                           min_positive_rate=Decimal("0.97"), min_month_finish_rate=Decimal("0.94"))
@@ -252,20 +249,17 @@ Algorithm (exact, per enabled pair plan and per platform in the plan):
 
 1. resolve `source`.
 2. `base_rate` → read `rates.base(pair)`; missing → `MissingRateError`.
-3. `base_rate_minus_spread` → `rates.base(linked_pair) - UAH_SPREAD[platform]`;
-   missing base → `MissingRateError`. **Only `base_rate` is consulted for UAH** — never the
-   market parser, never the sibling USDC base_rate.
-4. `market_middle` → `market.middle(platform, pair)`; missing snapshot or empty filtered
+3. `market_middle` → `market.middle(platform, pair)`; missing snapshot or empty filtered
    range → `MissingMarketDataError`.
-5. `copy:<PLATFORM>` → the already-computed price of the same pair on `<PLATFORM>`
+4. `copy:<PLATFORM>` → the already-computed price of the same pair on `<PLATFORM>`
    from `previous` (this cycle's results; key `(platform_lower, pair.symbol)`).
    Missing → `MissingMarketDataError`.
-6. `price = raw + plan.price_offset`, then `quantize_price(price, pair.fiat)`.
-7. `cap = rates.cap(pair)`; missing → `MissingCapError` (an ad MUST NOT be published
+5. `price = raw + plan.price_offset`, then `quantize_price(price, pair.fiat)`.
+6. `cap = rates.cap(pair)`; missing → `MissingCapError` (an ad MUST NOT be priced
    without a ceiling). If `price > cap`: `price = cap`, `clamped = True`, and a WARNING is
-   logged. Cap wins over every other rule (including the hardcoded UAH spread).
-8. `price <= 0` after clamping → `PriceError` (never publish garbage).
-9. emit `ComputedAd` with all accounts of that platform listed for the pair.
+   logged. Cap wins over every other rule.
+7. `price <= 0` after clamping → `PriceError` (never publish garbage).
+8. emit `ComputedAd` with all accounts of that platform listed for the pair.
 
 `quantize_price(value, fiat)` = `value.quantize(PRICE_TICK[fiat], rounding=ROUND_HALF_UP)`.
 
@@ -339,7 +333,7 @@ failing venue never aborts the pass.
 
 `BotServices.run_parser(pairs=None)` runs that pass and then persists the store
 (`MarketStore.save()`, a no-op without a configured path), because the CLI `parser` command
-and a later `publish`/`tick` run are *separate processes*: without the write, the second
+and a later `rates`/`pln-edits` run are *separate processes*: without the write, the second
 process would price `market_middle` scenarios from an empty store. The CLI `--dry-run` path
 parses into a scratch `MarketStore` and therefore never writes.
 
@@ -359,19 +353,13 @@ parses into a scratch `MarketStore` and therefore never writes.
   `ensure_success`, `parse_ad_response`).
 - `MarketFetchResult(platform, pair, fetched, kept, middle, error)` is the return item of
   `MarketParser.run_once(...)`.
-- **Binance create body (live-verified 2026-09-24).** ``/sapi/v1/c2c/agent/ads/post`` rejects an
-  abbreviated object with ``-1000 System abnormality``; the adapter MUST send the full field set
-  Binance's own web client sends (``ADS_CONDITION_DEFAULTS`` plus the ad's own fields).
-  ``classify`` MUST be ``"profession"`` for a merchant account — ``"mass"`` is refused with
-  ``83749 You do not have permission`` — and ``tradeType`` is spelled ``"SELL"``/``"BUY"``
-  (``ADS_TRADE_TYPE``), not the ``1``/``0`` of the private search paths. Sell ``tradeMethods``
-  entries carry the venue's whole method object (``identifier``/``payId``/``payType`` plus the
-  display fields).
+- **Binance ad updates are buy-only.** ``build_update_ad_request`` refuses any spec that is
+  not a buy ad before a request is built. The update body spells ``tradeType`` ``"BUY"``
+  (``ADS_TRADE_TYPE``), not the ``0`` of the private search paths.
 - **Binance update body (live-verified).** ``getDetailByNo`` answers with the *read* shape of
-  ``tradeMethods`` (``identifier``/``tradeMethodName``/``iconUrlColor``, no ``payId``); echoing it
-  back is refused with ``83664 You have not added any payment method yet``. ``_merged_update_body``
-  therefore re-resolves the blueprint's methods (or maps the ad's own identifiers back onto the
-  account's records) into the write shape before posting.
+  ``tradeMethods`` (``identifier``/``tradeMethodName``/``iconUrlColor``); a buy ad is written
+  back with ``{"identifier": ...}`` entries only (the spec's methods when it carries any —
+  names resolved against the account's own methods, ids verbatim — else the ad's own).
 
 ```python
 @dataclass(frozen=True)
@@ -405,18 +393,17 @@ class ExchangeAdapter(ABC):
     @abstractmethod
     def build_list_ads_request(self, account: Account, pair: Pair) -> HttpRequest
     @abstractmethod
-    def build_create_ad_request(self, account: Account, spec: AdSpec, adv_no: str | None = None) -> HttpRequest
-    @abstractmethod
     def build_update_ad_request(self, account: Account, spec: AdSpec, adv_no: str) -> HttpRequest
     @abstractmethod
     def parse_ad_response(self, payload: Any) -> AdActionResult
 ```
 `AdSpec(pair, price, min_amount, max_amount, payment_methods=(), active=True,
-side=SIDE_SELL, quantity=None, payment_ids=())` is the publish payload;
+side=SIDE_SELL, quantity=None, payment_ids=(), price_floating_ratio=None)` is the edit
+payload (`edit_ad` always fills it from the live **buy** ad);
 `quantity`/`payment_ids` are optional (an adapter derives the token amount from
 `max_amount / price` and resolves venue payment-method ids — see §9);
-`AdActionResult(platform, account_id, pair, adv_no, price, created, raw)` is the result.
-`ExchangeAdapter.parse_ad_result(payload, *, account, pair, spec, created, adv_no=None)`
+`AdActionResult(platform, account_id, pair, adv_no, price, raw)` is the result.
+`ExchangeAdapter.parse_ad_result(payload, *, account, pair, spec, adv_no=None)`
 is the shared bridge that fills the identity fields around a venue-specific
 `parse_ad_response(payload)`, and `AdSpec.active` is the single on/off control that each
 adapter maps onto its venue's mechanism.
@@ -438,7 +425,7 @@ Adapter rules:
 `exchanges/__init__.py` exposes `ADAPTERS: dict[str, type[ExchangeAdapter]]` and
 `build_adapters(transport=None) -> dict[str, ExchangeAdapter]`.
 
-## 10. Publisher (`p2pbot/publisher.py`)
+## 10. Publisher (`p2pbot/publisher.py`) and the PLN edit queue (`p2pbot/edit_queue.py`)
 
 ```python
 class AdStore:                     # (account_id, pair) -> {"adv_no":... , "price":..., "updated_at":...}
@@ -448,30 +435,42 @@ class AdStore:                     # (account_id, pair) -> {"adv_no":... , "pric
 
 class AdPublisher:
     def __init__(self, adapters: Mapping[str, ExchangeAdapter], settings: Settings,
-                 store: AdStore, rates: RateStore, dry_run: bool = False, *, plans=None) -> None
-    def set_blueprint(self, blueprint) -> None   # so ad specs carry the pair plan amounts
-    def plan_for(self, pair: Pair) -> PairPlan | None
-    def publish(self, ads: Sequence[ComputedAd], *, dry_run: bool | None = None,
-                active: bool | None = None, create_missing: bool = True) -> tuple[PublishResult, ...]
-        # `dry_run`/`active` override the constructor default / the spec's active flag for
-        # this call; returns `models.PublishResult` records (one per account), never raises
-        # for a per-account ExchangeError. Duplicate account ids of the same ad are
-        # canonicalised (`AccountRef.parse(...).id`), so an account is published once.
-
-def build_ad_spec(computed: ComputedAd, source: Blueprint | PairPlan, *,
-                  price: Decimal | None = None, active: bool | None = None) -> AdSpec
-    # price defaults to the (already cap-re-asserted) ComputedAd price; min/max/payment
-    # methods/active come from the pair plan, with blueprint defaults as fallback.
+                 store: AdStore, rates: RateStore, dry_run: bool = False) -> None
+    def fetch_own_ads(self, account_ids=None, *, include_closed=False) -> tuple[OwnAdsResult, ...]
+    def edit_ad(self, account_id, pair, adv_no=None, *, price=None, price_floating_ratio=None,
+                min_amount=None, max_amount=None, quantity=None, payment_methods=None,
+                active=None, dry_run=None) -> PublishResult
 ```
-`publish` flow per `ComputedAd` × account:
-1. **Re-assert the cap**: `cap = rates.cap(ad.pair)`; `if ad.price > cap: price = cap`
-   (defence in depth — the publisher is the last gate before the exchange sees a price).
-2. `dry_run` → no request built; result records the attempt (`dry_run=True`).
-3. Existing record with `adv_no` → `build_update_ad_request`; otherwise → `build_create_ad_request`
-   (`create_missing=False` downgrades to a `skipped` result).
-4. Store/refresh the record with the venue-returned `adv_no` and the pushed price.
-5. Any `ExchangeError` is captured per account into `PublishResult(status="error", error=...)`;
-   other accounts still proceed.
+`edit_ad` never creates an ad and only edits **buy** ads: it reads the live ad
+(`fetch_own_ads`), keeps every field not passed, re-asserts a stored `cap_rate` (a fixed
+price is clamped, a floating ratio estimated above the cap is refused) and refuses sell,
+missing, closed or mismatched ads, offline ads without `active=True`, and `active=False`
+combined with other changes. Faults become `PublishResult(status="error")`, never raised.
+
+`run_pln_edit_queue(blueprint, engine, publisher, *, parser=None, dry_run=False, pairs=None)`
+runs one producer/consumer pass over a `queue.Queue(maxsize=1)`: the producer parses and
+prices the PLN pairs (only `pairs` when given; a requested pair missing from the scenario is
+reported) and queues one `AdEdit` per online **buy** ad of each pair; the consumer applies
+each with `edit_ad(..., price=...)`.
+
+`run_uah_rate_queue(rate, publisher, *, steps, dry_run=False, account_ids=None)` is the
+`/setrate` producer on the same queue machinery (`run_edit_queue`): it reads every
+configured account's own ads and queues, per account and pair, the online **buy** ads as a
+descending ladder (ranked by current price): `UAH/USDT` gets `rate`, `rate - step`,
+`rate - 2*step`, … (rate quantized to the UAH tick), `UAH/USDC` the same ladder one step
+lower. A cap is optional for the UAH pairs: when one is stored (`caps`, from `/setcap`)
+the ladder's top is clamped to it; without one the ladder starts at the rate. (PLN keeps
+the fail-closed rule through the engine.) Edits are queued rising-first (top down) then
+falling (bottom up), so no ad passes through a neighbour's price.
+`steps` come from `p2pbot/uah_config.py` (`STEP`, validated by `load_uah_steps()` into
+`BotServices.uah_steps`); the façade method is `BotServices.set_uah_rate(rate, *, dry_run)`.
+
+`p2pbot/cron_config.py` holds the two operator settings `SCHEDULE_TIME` (minutes) and
+`PAIRS` (tickers or `PLN/...` symbols). `load_cron_config()` validates them into
+`CronConfig(interval_minutes, pairs)` (`ConfigError` naming the setting otherwise);
+`build_services` stores it as `BotServices.cron` and registers the `pln-edits` job
+(`services.run_cron_edits`) every `interval_minutes`; the `pln-edits` CLI command and
+`verify-config` use the same settings.
 
 ## 11. Telegram bot (`p2pbot/telegram/`)
 
@@ -490,22 +489,18 @@ def build_ad_spec(computed: ComputedAd, source: Blueprint | PairPlan, *,
 - Rate-limit per owner: > 20 messages / 60 s → the owner is answered `Too many requests.`
   and further messages are ignored until the window frees (sliding window; a refused
   message does not consume the window).
-- Secrets never echoed; `/status` output is redaction-safe.
+- Secrets never echoed; every reply is redaction-safe.
 
 ### 11.2 Commands (router in `handlers.py`, returns reply text; no I/O to Telegram)
 ```
 /start, /help                 usage summary
-/setbase <PAIR> <RATE>        store base_rate            (e.g. /setbase UAH/USDT 47.00)
+/setbase <PAIR> <RATE>        store base_rate            (e.g. /setbase PLN/USDT 3.85)
 /setcap  <PAIR> <RATE>        store cap_rate
+/setrate <RATE> [--dry]       reprice UAH buy ads as a per-account STEP ladder (cap optional)
+/getads [<PAIR>|all] [--offline]  list every account's ads (default UAH/USDT + UAH/USDC, online)
 /rates                        base/cap table + computed prices per platform
 /scenarios                    list blueprint files
 /scenario <name>              activate scenario (reload blueprint, validate account refs)
-/parse [<PAIR>]               run the market parser once, report kept/middle per platform
-/publish [--dry]              compute + create/update ads now
-/pause [<PAIR>]               deactivate ads
-/resume [<PAIR>]              reactivate ads
-/status                       scenario, rates, scheduler next run, last publish results
-/version                      version + uptime
 ```
 Malformed command → `Usage: /setbase <PAIR> <RATE>`; unknown command → help hint.
 All handler exceptions are caught and turned into an error reply containing the exception
@@ -538,7 +533,7 @@ under `if TYPE_CHECKING:` so `p2pbot.telegram` keeps working while `services.py`
 @dataclass(frozen=True)
 class PublishResult:
     account_id: str; platform: str; pair: Pair
-    status: str            # "created" | "updated" | "skipped" | "dry_run" | "error"
+    status: str            # "updated" | "skipped" | "dry_run" | "error"
     price: Decimal | None = None; adv_no: str | None = None
     error: str | None = None; dry_run: bool = False
 
@@ -554,7 +549,6 @@ class StatusSnapshot:
     version: str; scenario: str | None; fiat: str | None; strategy: str | None
     rates: tuple[RateRow, ...]; prices: tuple[ComputedAd, ...]
     market: tuple[MarketRow, ...]; jobs: tuple[JobRow, ...]
-    last_publish: tuple[PublishResult, ...]
     engine_error: str | None = None            # first problem, or a scenario-level fault
     engine_problems: tuple[str, ...] = ()      # SPEC §7.1 skipped entries, always present
 
@@ -574,30 +568,27 @@ class BotServices:                                   # duck-typed façade
     market: MarketStore
     scheduler: Scheduler
     scenarios: ScenarioManager
-    def refresh_prices(self, *, dry_run: bool = False) -> tuple[PublishResult, ...]
-    def set_active(self, active: bool, pairs: Iterable[str] | None = None) -> tuple[PublishResult, ...]
     def run_parser(self, pairs: Iterable[str] | None = None) -> tuple[MarketFetchResult, ...]
     def snapshot(self) -> StatusSnapshot
+    def set_uah_rate(self, rate: Decimal, *, dry_run: bool = False) -> EditQueueReport
+    def get_own_ads(self) -> tuple[OwnAdsResult, ...]
 ```
-Error policy for the façade: `refresh_prices`/`set_active`/`run_parser` never raise for
-per-account failures (they surface as `status="error"` results); they DO raise
-`EngineError`/`ConfigError` for missing rates/caps so the handler can report it.
+Error policy for the façade: `run_parser` never raises for a per-venue failure (it surfaces
+in the `MarketFetchResult.error`); the façade DOES raise `EngineError`/`ConfigError` for a
+missing scenario so the handler can report it. The façade never pushes an advertisement.
 
 ## 12. CLI (`p2pbot/cli.py`, `run.py`)
 
 ```
 python run.py bot                       # long-poll bot + scheduler thread
-python run.py tick                      # one engine cycle: parser due-jobs -> compute -> publish
 python run.py parser --scenario pln     # one market fetch pass (--dry-run prints, no state write)
-python run.py rates  --scenario uah     # print computed prices (no publishing)
-python run.py publish --scenario uah [--dry-run]
+python run.py rates  --scenario pln     # print computed prices (changes nothing)
+python run.py pln-edits --scenario pln [--dry-run]   # reprice the live PLN buy ads
 python run.py verify-config             # validate .env accounts + all blueprints, exit 1 on error
 ```
-`tick`/`publish` honour `--dry-run`. Exit codes: 0 ok, 1 configuration error, 2 runtime error.
-Additionally — because the engine isolates partial failures instead of raising (§7.1) — the
-`tick`/`publish` commands exit **1 when problems blocked every advertisement** (nothing was
-pushed at all) while still exiting 0 as soon as something was pushed or when nothing needed
-pushing. An unattended scheduler must not read "nothing happened" as success.
+`pln-edits` honours `--dry-run`. Exit codes: 0 ok, 1 configuration error, 2 runtime error.
+Additionally `pln-edits` exits **1 when problems blocked every edit** (nothing edited and
+nothing already at its price), so an unattended scheduler never reads that as success.
 CLI is covered by tests through `main(argv, env=...)` returning an int.
 
 ## 13. Testing requirements (QA)
@@ -610,13 +601,12 @@ CLI is covered by tests through `main(argv, env=...)` returning an int.
   must be justified in a comment.
 - Pass rate must exceed 98 % (target 100 %).
 - Required test areas: constants/quantization, config/account discovery (+ error paths),
-  blueprint validation, RateStore, engine (every source, cap clamping incl. spread-vs-cap
-  conflict, missing rates/caps, price offsets, ordering, copy chains), market filtering
+  blueprint validation, RateStore, engine (every source, cap clamping, missing rates/caps, price offsets, ordering, copy chains), market filtering
   (each Binance threshold boundary: exactly 500 → excluded, 501 → included; 0.97 → excluded,
   0.971 → included; 0.94 → excluded, 0.941 → included), middle computation, cron parsing
   and `next_after`, scheduler due/reschedule, adapters (request building incl. signatures,
-  response parsing, error bodies), publisher (cap re-assertion, create vs update, dry-run,
-  per-account error isolation), telegram security (owner gate, every attachment key,
+  response parsing, error bodies), publisher (edit_ad: live-ad based edits, buy-only,
+  cap re-assertion, dry-run, per-account error isolation), the PLN edit queue, telegram security (owner gate, every attachment key,
   non-private chat, rate limit), handlers (each command incl. malformed input),
   bot loop (offset bookkeeping, retry/backoff), CLI (all subcommands, dry-run, exit codes).
 - No test may assert implementation trivia (private call counts) unless the behaviour is
@@ -625,8 +615,8 @@ CLI is covered by tests through `main(argv, env=...)` returning an int.
 ## 14. Definition of done
 
 1. `python run.py verify-config` passes with the shipped `.env.example`-derived config.
-2. `python run.py rates --scenario scenarios/uah.json` prints UAH/USDT and UAH/USDC prices
-   per platform honouring the hardcoded spreads and the cap.
+2. `python run.py rates --scenario pln` prints PLN/USDT and PLN/USDC prices per platform
+   honouring the cap.
 3. `python run.py parser --scenario scenarios/pln.json --dry-run` prints filtered ad counts
    and middle prices from live public endpoints (network-permitting), ByBit derived by copy.
 4. Bot refuses any non-owner sender and any attachment; owner commands update state.

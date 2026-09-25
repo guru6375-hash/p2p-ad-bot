@@ -300,11 +300,11 @@ def test_snapshot_key_is_canonical() -> None:
 
 # -- filters resolution ----------------------------------------------------------------
 def test_default_filters_follow_the_blueprint_then_the_hardcoded_policy(
-    pln_blueprint, uah_blueprint
+    pln_blueprint, base_rate_blueprint
 ) -> None:
-    assert default_filters_for("binance", uah_blueprint.pair("UAH/USDT")) == BINANCE_FILTERS
-    assert default_filters_for("okx", uah_blueprint.pair("UAH/USDT")) == OKX_FILTERS
-    assert default_filters_for("bybit", uah_blueprint.pair("UAH/USDT")) == Filters(user_type="merchant")
+    assert default_filters_for("binance", base_rate_blueprint.pair("UAH/USDT")) == BINANCE_FILTERS
+    assert default_filters_for("okx", base_rate_blueprint.pair("UAH/USDT")) == OKX_FILTERS
+    assert default_filters_for("bybit", base_rate_blueprint.pair("UAH/USDT")) == Filters(user_type="merchant")
     assert default_filters_for("binance", pln_blueprint.pair("PLN/USDT")) == BINANCE_FILTERS
 
 
@@ -425,10 +425,10 @@ def test_parser_captures_a_transport_failure_and_leaves_the_snapshot_untouched(
     assert results[1].ok is True  # the healthy venue still ran
 
 
-def test_parser_run_once_on_a_blueprint_without_market_sources(uah_blueprint) -> None:
+def test_parser_run_once_on_a_blueprint_without_market_sources(base_rate_blueprint) -> None:
     parser = _parser({"binance": _StubAdapter("binance")})
-    assert parser.run_once(uah_blueprint) == ()
-    assert parser.middle_for(uah_blueprint, "UAH/USDT", "binance") is None
+    assert parser.run_once(base_rate_blueprint) == ()
+    assert parser.middle_for(base_rate_blueprint, "UAH/USDT", "binance") is None
 
 
 def test_parser_middle_for_reads_the_store(pln_blueprint) -> None:
@@ -454,34 +454,3 @@ def test_parser_stores_the_snapshot_the_adapter_returned(pln_blueprint) -> None:
     assert stored.middle == Decimal("4.33")
     assert stored.filtered[0].price == Decimal("4.33")
     assert stored.fetched_at is not None
-
-
-def test_engine_can_price_from_a_parser_produced_snapshot(pln_blueprint, uah_blueprint) -> None:
-    """Cross-check: the parser's snapshot feeds ``RateEngine``'s market_middle source."""
-    from p2pbot.engine import RateEngine
-    from p2pbot.rates import RateStore
-
-    store = MarketStore()
-    adapter = _StubAdapter(
-        "binance",
-        [
-            make_ad(platform="binance", pair="PLN/USDT", price="4.29"),
-            make_ad(platform="binance", pair="PLN/USDT", price="4.33", adv_no="adv-2"),
-        ],
-    )
-    okx = _StubAdapter("okx", [make_ad(platform="okx", pair="PLN/USDT", price="4.31")])
-    parser = MarketParser({"binance": adapter, "okx": okx}, store)
-    parser.run_once(pln_blueprint, pairs=["PLN/USDT"])
-
-    rates = RateStore()
-    rates.set_cap("PLN/USDT", "10.00")
-    ads = RateEngine(pln_blueprint, rates, store).compute_pair(
-        pln_blueprint.pair("PLN/USDT"), {}
-    )
-    by_platform = {ad.platform: ad.price for ad in ads}
-    assert by_platform["binance"] == Decimal("4.31")
-    assert by_platform["okx"] == Decimal("4.31")
-    assert by_platform["bybit"] == Decimal("4.31")  # copy:Binance
-
-    with pytest.raises(MissingMarketDataError):
-        RateEngine(pln_blueprint, rates, None).compute_pair(pln_blueprint.pair("PLN/USDT"), {})

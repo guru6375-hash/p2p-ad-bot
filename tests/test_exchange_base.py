@@ -23,7 +23,7 @@ from p2pbot.exchanges.base import (
     UrllibTransport,
     safe_json,
 )
-from p2pbot.models import Account, AdActionResult, AdSpec, CompetitorAd, Filters, Pair
+from p2pbot.models import Account, AdActionResult, AdSpec, CompetitorAd, Filters, OwnAd, Pair
 
 from _fake_transport import (
     FIXED_NOW,
@@ -106,13 +106,23 @@ class StubAdapter(ExchangeAdapter):
     def build_list_ads_request(self, account: Account, pair: Pair) -> HttpRequest:
         return HttpRequest(method="POST", url="https://stub.test/list", json_body={"fiat": pair.fiat})
 
-    def build_create_ad_request(
-        self, account: Account, spec: AdSpec, adv_no: str | None = None
-    ) -> HttpRequest:
-        return HttpRequest(method="POST", url="https://stub.test/create")
-
     def build_update_ad_request(self, account: Account, spec: AdSpec, adv_no: str) -> HttpRequest:
         return HttpRequest(method="POST", url="https://stub.test/update", json_body={"id": adv_no})
+
+    def build_own_ads_request(self, account: Account, *, page: int) -> HttpRequest:
+        return HttpRequest(method="POST", url="https://stub.test/own", json_body={"page": page})
+
+    def parse_own_ad(self, row: Mapping[str, Any], account: Account) -> OwnAd | None:
+        if not row.get("advNo"):
+            return None
+        return OwnAd(
+            platform=self.platform,
+            account_id=account.id,
+            adv_no=str(row["advNo"]),
+            pair=UAH_USDT,
+            side=SIDE_SELL,
+            status=str(row.get("status", "online")),
+        )
 
     def parse_ad_response(self, payload: Any) -> AdActionResult:
         data = payload.get("data") if isinstance(payload, Mapping) else None
@@ -123,7 +133,6 @@ class StubAdapter(ExchangeAdapter):
             pair=Pair.parse("XXX/XXX"),
             adv_no=str(data) if isinstance(data, str) else None,
             price=Decimal(str(price)) if price is not None else None,  # type: ignore[arg-type]
-            created=False,
             raw={"payload": payload},
         )
 
@@ -513,7 +522,9 @@ def test_send_private_raises_api_error_on_an_http_failure() -> None:
 
     assert excinfo.value.status == 401
     assert excinfo.value.payload == {"code": -2015, "msg": "Invalid API-key"}
-    assert "stub request for account Stub#1 failed with HTTP 401" in str(excinfo.value)
+    assert str(excinfo.value) == (
+        "stub request for account Stub#1 failed with HTTP 401 (code=-2015, msg=Invalid API-key)"
+    )
 
 
 def test_send_private_raises_when_the_venue_payload_reports_failure() -> None:
@@ -543,6 +554,90 @@ def test_list_my_ads_uses_the_listing_request_and_the_default_parser() -> None:
     assert adapter.transport.last.json_body == {"fiat": "UAH"}
 
 
+class _PagedStub(StubAdapter):
+    own_ads_page_size = 2
+    own_ads_max_pages = 3
+
+
+def _paged(*pages: Any) -> Any:
+    return _PagedStub(FakeTransport(*(json_response(page) for page in pages)), now=FixedClock())
+
+
+def test_fetch_own_ads_reads_pages_until_a_short_one() -> None:
+    adapter = _paged(
+        [{"advNo": "1"}, {"advNo": "2", "status": "offline"}],
+        [{"advNo": "3"}],
+    )
+
+    ads = adapter.fetch_own_ads(ACCOUNT)
+
+    assert [(ad.adv_no, ad.status, ad.active) for ad in ads] == [
+        ("1", "online", True),
+        ("2", "offline", False),
+        ("3", "online", True),
+    ]
+    assert all(ad.account_id == "Stub#1" for ad in ads)
+    assert [request.json_body for request in adapter.transport.requests] == [
+        {"page": 1},
+        {"page": 2},
+    ]
+
+
+def test_fetch_own_ads_of_an_empty_profile_is_empty() -> None:
+    adapter = _paged([])
+
+    assert adapter.fetch_own_ads(ACCOUNT) == ()
+    assert len(adapter.transport) == 1
+
+
+def test_fetch_own_ads_skips_unidentified_rows_and_duplicates() -> None:
+    adapter = _paged(
+        [{"advNo": "1"}, {"advNo": ""}],
+        [{"advNo": "1"}, {"advNo": "2"}],
+        [],
+    )
+
+    assert [ad.adv_no for ad in adapter.fetch_own_ads(ACCOUNT)] == ["1", "2"]
+
+
+def test_fetch_own_ads_stops_when_the_venue_repeats_a_page() -> None:
+    page = [{"advNo": "1"}, {"advNo": "2"}]
+    adapter = _paged(page, page)
+
+    assert [ad.adv_no for ad in adapter.fetch_own_ads(ACCOUNT)] == ["1", "2"]
+    assert len(adapter.transport) == 2
+
+
+def test_fetch_own_ads_warns_when_the_page_bound_is_reached(caplog) -> None:
+    adapter = _paged(
+        [{"advNo": "1"}, {"advNo": "2"}],
+        [{"advNo": "3"}, {"advNo": "4"}],
+        [{"advNo": "5"}, {"advNo": "6"}],
+    )
+
+    ads = adapter.fetch_own_ads(ACCOUNT)
+
+    assert len(ads) == 6
+    assert "stopped after 3 pages" in caplog.text
+
+
+def test_fetch_own_ads_reads_on_when_the_venue_caps_the_page_size() -> None:
+    """Asked for 2 per page, a venue that answers 1 per page is still read to the end."""
+    adapter = _paged([{"advNo": "1"}], [{"advNo": "2"}], [])
+
+    assert [ad.adv_no for ad in adapter.fetch_own_ads(ACCOUNT)] == ["1", "2"]
+    assert len(adapter.transport) == 3  # the empty page ends it
+
+
+def test_fetch_own_ads_propagates_a_venue_error() -> None:
+    adapter = _PagedStub(
+        FakeTransport(json_response({"msg": "no"}, status=401)), now=FixedClock()
+    )
+
+    with pytest.raises(ApiError):
+        adapter.fetch_own_ads(ACCOUNT)
+
+
 def test_parse_ad_list_default_returns_only_mapping_items_of_a_list_payload() -> None:
     adapter = StubAdapter(FakeTransport())
 
@@ -568,7 +663,6 @@ def test_parse_ad_result_fills_identity_fields_from_the_request_context() -> Non
         account=ACCOUNT,
         pair=UAH_USDT,
         spec=spec,
-        created=True,
     )
 
     assert result == AdActionResult(
@@ -577,7 +671,6 @@ def test_parse_ad_result_fills_identity_fields_from_the_request_context() -> Non
         pair=UAH_USDT,
         adv_no="13928301035093368832",
         price=Decimal("47.25"),
-        created=True,
         raw={"payload": {"data": "13928301035093368832"}},
     )
 
@@ -591,11 +684,9 @@ def test_parse_ad_result_prefers_the_venue_echoed_price() -> None:
         account=ACCOUNT,
         pair=UAH_USDT,
         spec=spec,
-        created=False,
     )
 
     assert result.price == Decimal("47.99")
-    assert result.created is False
     assert result.adv_no == "9"
 
 
@@ -608,7 +699,6 @@ def test_parse_ad_result_falls_back_to_the_addressed_adv_no() -> None:
         account=ACCOUNT,
         pair=UAH_USDT,
         spec=spec,
-        created=False,
         adv_no="777",
     )
 
@@ -621,7 +711,7 @@ def test_parse_ad_result_keeps_the_venue_payload_as_raw() -> None:
     payload = {"code": "000000", "data": {"advNo": "5"}}
 
     result = adapter.parse_ad_result(
-        payload, account=ACCOUNT, pair=UAH_USDT, spec=make_spec(), created=True
+        payload, account=ACCOUNT, pair=UAH_USDT, spec=make_spec()
     )
 
     assert result.raw == {"payload": payload}
@@ -671,3 +761,23 @@ def test_registry_reexports_the_shared_plumbing() -> None:
     assert exchanges.Transport is Transport
     assert exchanges.UrllibTransport is UrllibTransport
     assert exchanges.ExchangeAdapter is ExchangeAdapter
+
+
+@pytest.mark.parametrize(
+    ("body", "reason"),
+    [
+        ({"ret_code": 10001, "ret_msg": "Request parameter error."}, " (code=10001, msg=Request parameter error.)"),
+        ({"code": "50111"}, " (code=50111)"),
+        ({"message": "bad"}, " (msg=bad)"),
+        ({}, ""),
+        (None, ""),
+    ],
+)
+def test_http_errors_carry_the_venue_reason(body: Any, reason: str) -> None:
+    response = json_response(body, status=400) if body is not None else text_response("oops", status=400)
+    adapter = make_adapter(response)
+
+    with pytest.raises(ApiError) as excinfo:
+        adapter.send_private(ACCOUNT, adapter.build_list_ads_request(ACCOUNT, UAH_USDT))
+
+    assert str(excinfo.value) == f"stub request for account Stub#1 failed with HTTP 400{reason}"

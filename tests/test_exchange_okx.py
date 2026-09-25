@@ -1,7 +1,7 @@
 """``p2pbot/exchanges/okx.py``: public marketplace search + the v5 API-key ad surface.
 
 The public fixtures are the real captures of ``GET /v3/c2c/tradingOrders/getMarketplaceAdsPrelogin``
-from ``docs/research/okx.md``. The private create/update body *field names* are UNCONFIRMED
+from ``docs/research/okx.md``. The private update body *field names* are UNCONFIRMED
 (no merchant credentials exist), so those tests assert the shape the adapter produces - the
 fields it selects, the values derived from the ``AdSpec`` and the signing scheme - and never
 claim that OKX would accept the names.
@@ -29,10 +29,9 @@ from p2pbot.exchanges.okx import (
     AD_BODY_FIELDS,
     AD_STATUS_VALUES,
     BASE_URL,
-    CREATE_AD_FIELDS,
-    CREATE_AD_PATH,
     LIST_ADS_FIELDS,
     LIST_ADS_PATH,
+    OWN_ADS_FIELDS,
     SEARCH_PATH,
     UPDATE_AD_FIELDS,
     UPDATE_AD_PATH,
@@ -435,7 +434,7 @@ def test_list_ads_request_uses_the_listing_fields_and_signs_them() -> None:
     assert_okx_signature(request)
 
 
-def test_create_ad_request_shape_is_derived_from_the_spec() -> None:
+def test_update_ad_request_derives_the_quantity_and_sends_the_method_names() -> None:
     spec = make_spec(
         price="47.00",
         min_amount="1000.00",
@@ -443,57 +442,46 @@ def test_create_ad_request_shape_is_derived_from_the_spec() -> None:
         payment_methods=("PrivatBank (CARD)",),
     )
 
-    request = make_okx().build_create_ad_request(ACCOUNT, spec)
+    body = make_okx().build_update_ad_request(ACCOUNT, spec, "1").json_body
 
-    assert request.method == "POST"
-    assert request.url == f"{BASE_URL}{CREATE_AD_PATH}"
-    assert set(request.json_body) == set(CREATE_AD_FIELDS.values())
-    assert request.json_body == {
-        AD_BODY_FIELDS["crypto"]: "USDT",
-        AD_BODY_FIELDS["fiat"]: "UAH",
-        AD_BODY_FIELDS["side"]: "sell",
-        AD_BODY_FIELDS["price"]: "47.00",
-        AD_BODY_FIELDS["min_amount"]: "1000.00",
-        AD_BODY_FIELDS["max_amount"]: "47000.00",
-        AD_BODY_FIELDS["quantity"]: "1000.00000000",  # floor(max_amount / price) at QUANTITY_STEP
-        AD_BODY_FIELDS["payment_methods"]: ["PrivatBank (CARD)"],
-        AD_BODY_FIELDS["status"]: AD_STATUS_VALUES[True],
-    }
-    assert_okx_signature(request)
+    # floor(max_amount / price) at QUANTITY_STEP
+    assert body[AD_BODY_FIELDS["quantity"]] == "1000.00000000"
+    assert body[AD_BODY_FIELDS["payment_methods"]] == ["PrivatBank (CARD)"]
+    assert body[AD_BODY_FIELDS["side"]] == "sell"
 
 
-def test_create_ad_request_uses_the_explicit_quantity_and_never_scientific_notation() -> None:
+def test_update_ad_request_uses_the_explicit_quantity_and_never_scientific_notation() -> None:
     spec = make_spec(price="1E+2", min_amount="100", max_amount="10000", quantity="3.5", payment_methods=("BLIK",))
 
-    body = make_okx().build_create_ad_request(ACCOUNT, spec).json_body
+    body = make_okx().build_update_ad_request(ACCOUNT, spec, "1").json_body
 
     assert body[AD_BODY_FIELDS["price"]] == "100"
     assert body[AD_BODY_FIELDS["quantity"]] == "3.5"
 
 
-def test_create_ad_request_prefers_payment_ids_and_normalizes_the_side() -> None:
+def test_update_ad_request_prefers_payment_ids_and_normalizes_the_side() -> None:
     spec = make_spec(
         side="SELL",
         payment_methods=("PrivatBank (CARD)",),
         payment_ids=("pm-1", "pm-2"),
     )
 
-    body = make_okx().build_create_ad_request(ACCOUNT, spec).json_body
+    body = make_okx().build_update_ad_request(ACCOUNT, spec, "1").json_body
 
     assert body[AD_BODY_FIELDS["side"]] == "sell"
     assert body[AD_BODY_FIELDS["payment_methods"]] == ["pm-1", "pm-2"]
 
 
 @pytest.mark.parametrize(("active", "expected"), [(True, "active"), (False, "inactive")])
-def test_create_ad_request_carries_the_on_off_state(active: bool, expected: str) -> None:
-    body = make_okx().build_create_ad_request(ACCOUNT, make_spec(active=active)).json_body
+def test_update_ad_request_carries_the_on_off_state(active: bool, expected: str) -> None:
+    body = make_okx().build_update_ad_request(ACCOUNT, make_spec(active=active), "1").json_body
 
     assert body[AD_BODY_FIELDS["status"]] == expected
 
 
-def test_create_ad_request_refuses_a_derived_quantity_without_a_positive_price() -> None:
+def test_update_ad_request_refuses_a_derived_quantity_without_a_positive_price() -> None:
     with pytest.raises(ConfigError) as excinfo:
-        make_okx().build_create_ad_request(ACCOUNT, make_spec(price="0"))
+        make_okx().build_update_ad_request(ACCOUNT, make_spec(price="0"), "1")
 
     assert str(excinfo.value) == (
         "cannot derive an advertisement quantity for UAH/USDT: the price must be positive"
@@ -563,7 +551,6 @@ def test_parse_ad_response_reads_the_id_aliases(record: dict[str, Any], expected
 
     assert result.adv_no == expected
     assert result.platform == "okx"
-    assert result.created is False
     assert result.raw == record
 
 
@@ -593,7 +580,7 @@ def test_parse_ad_response_keeps_a_single_record_object_directly() -> None:
     assert result.raw == {"adId": "7", "price": "47.10"}
 
 
-def test_parse_ad_result_bridges_the_create_response_into_the_identity_fields() -> None:
+def test_parse_ad_result_bridges_the_response_into_the_identity_fields() -> None:
     adapter = make_okx()
 
     result = adapter.parse_ad_result(
@@ -601,7 +588,6 @@ def test_parse_ad_result_bridges_the_create_response_into_the_identity_fields() 
         account=ACCOUNT,
         pair=UAH_USDT,
         spec=make_spec(price="47.00"),
-        created=True,
     )
 
     assert result.platform == "okx"
@@ -609,7 +595,6 @@ def test_parse_ad_result_bridges_the_create_response_into_the_identity_fields() 
     assert result.pair is UAH_USDT
     assert result.adv_no == "260924231439195"
     assert result.price == Decimal("47.00")  # no price in the payload -> the spec's price
-    assert result.created is True
     assert result.raw == {"adId": "260924231439195"}
 
 
@@ -621,19 +606,16 @@ def test_parse_ad_result_uses_the_addressed_adv_no_and_the_echoed_price() -> Non
         account=ACCOUNT,
         pair=UAH_USDT,
         spec=make_spec(price="47.00"),
-        created=False,
     )
 
     assert result.adv_no == "9"
     assert result.price == Decimal("47.99")
-    assert result.created is False
 
     fallback = adapter.parse_ad_result(
         {"code": "0"},
         account=ACCOUNT,
         pair=UAH_USDT,
         spec=make_spec(price="47.00"),
-        created=False,
         adv_no="777",
     )
     assert fallback.adv_no == "777"
@@ -684,3 +666,85 @@ def test_send_private_surfaces_an_http_401_before_parsing_the_envelope() -> None
 
     assert excinfo.value.status == 401
     assert "okx request for account Okx#1 failed with HTTP 401" in str(excinfo.value)
+
+
+# -- every own advertisement (wire names UNCONFIRMED, read through AD_BODY_FIELDS) --------
+def _own_row(ad_id: str, **fields: Any) -> dict[str, Any]:
+    row = {
+        AD_BODY_FIELDS["adv_no"]: ad_id,
+        AD_BODY_FIELDS["crypto"]: "USDT",
+        AD_BODY_FIELDS["fiat"]: "UAH",
+        AD_BODY_FIELDS["side"]: "sell",
+        AD_BODY_FIELDS["price"]: "47.00",
+        AD_BODY_FIELDS["min_amount"]: "1000",
+        AD_BODY_FIELDS["max_amount"]: "200000",
+        AD_BODY_FIELDS["quantity"]: "300",
+        AD_BODY_FIELDS["payment_methods"]: ["Monobank", " ", 7],
+        AD_BODY_FIELDS["status"]: AD_STATUS_VALUES[True],
+    }
+    row.update(fields)
+    return row
+
+
+def test_own_ads_request_carries_only_pagination_and_is_signed() -> None:
+    request = make_okx().build_own_ads_request(ACCOUNT, page=2)
+
+    assert request.url == f"{BASE_URL}{LIST_ADS_PATH}"
+    assert request.json_body == {
+        OWN_ADS_FIELDS["current_page"]: 2,
+        OWN_ADS_FIELDS["number_per_page"]: 100,
+    }
+    assert_okx_signature(request)
+
+
+def test_fetch_own_ads_normalizes_active_and_inactive_rows() -> None:
+    offline = _own_row(
+        "2",
+        **{
+            AD_BODY_FIELDS["status"]: AD_STATUS_VALUES[False].upper(),
+            AD_BODY_FIELDS["side"]: "BUY",
+            AD_BODY_FIELDS["fiat"]: "PLN",
+        },
+    )
+    adapter = make_okx(
+        json_response(
+            {
+                "code": "0",
+                "data": [
+                    _own_row("1"),
+                    offline,
+                    _own_row("3", **{AD_BODY_FIELDS["status"]: "??", AD_BODY_FIELDS["side"]: "x"}),
+                    _own_row(""),
+                    _own_row("4", **{AD_BODY_FIELDS["crypto"]: None}),
+                ],
+            }
+        ),
+        json_response({"code": "0", "data": []}),
+    )
+
+    ads = adapter.fetch_own_ads(ACCOUNT)
+
+    assert [(ad.adv_no, ad.pair.symbol, ad.side, ad.status) for ad in ads] == [
+        ("1", "UAH/USDT", "sell", "online"),
+        ("2", "PLN/USDT", "buy", "offline"),
+        ("3", "UAH/USDT", "", "unknown"),
+    ]
+    first = ads[0]
+    assert first.account_id == "Okx#1"
+    assert first.price == Decimal("47.00")
+    assert first.quantity == Decimal("300")
+    assert (first.min_amount, first.max_amount) == (Decimal("1000"), Decimal("200000"))
+    assert first.payment_methods == ("Monobank",)
+
+
+def test_own_ad_reports_its_amount_and_methods_for_an_update() -> None:
+    ad = make_okx().parse_own_ad(_own_row("1"), ACCOUNT)
+
+    assert ad.total_quantity == Decimal("300")
+    assert ad.payment_ids == ("Monobank",)
+    assert ad.price_floating_ratio is None
+
+
+def test_update_ad_request_refuses_a_floating_ratio() -> None:
+    with pytest.raises(ConfigError, match="okx: floating-price updates are not supported"):
+        make_okx().build_update_ad_request(ACCOUNT, make_spec(price_floating_ratio="91"), "1")

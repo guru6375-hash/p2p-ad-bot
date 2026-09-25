@@ -7,9 +7,8 @@ platform accounts) up front, so the engine and the market parser never have to g
 
 Hard rules encoded here:
 
-* ``fixed_spread`` scenarios may not carry spread values — the spread lives in
-  :mod:`p2pbot.constants` (``UAH_SPREAD``).
-* a non-anchor pair must resolve ``linked_to`` (auto-linked to the sibling anchor for UAH).
+* the only strategy is ``market_middle`` (prices from the competitor parser);
+* a non-anchor pair must declare ``linked_to`` an anchor pair of the same fiat;
 * ``copy:<Platform>`` must point at a real, non-copy plan of the same pair.
 """
 
@@ -38,17 +37,14 @@ __all__ = [
 BLUEPRINT_VERSION = 1
 SUPPORTED_FIATS: tuple[str, ...] = ("UAH", "PLN")
 
-STRATEGY_FIXED_SPREAD = "fixed_spread"
 STRATEGY_MARKET_MIDDLE = "market_middle"
-STRATEGIES: tuple[str, ...] = (STRATEGY_FIXED_SPREAD, STRATEGY_MARKET_MIDDLE)
+STRATEGIES: tuple[str, ...] = (STRATEGY_MARKET_MIDDLE,)
 
 SOURCE_BASE_RATE = "base_rate"
-SOURCE_BASE_RATE_MINUS_SPREAD = "base_rate_minus_spread"
 SOURCE_MARKET_MIDDLE = "market_middle"
 COPY_PREFIX = "copy:"
 SOURCE_EXPRESSIONS: tuple[str, ...] = (
     SOURCE_BASE_RATE,
-    SOURCE_BASE_RATE_MINUS_SPREAD,
     SOURCE_MARKET_MIDDLE,
     f"{COPY_PREFIX}<Platform>",
 )
@@ -56,17 +52,10 @@ SOURCE_EXPRESSIONS: tuple[str, ...] = (
 #: ``market_middle`` scenarios derive ByBit from Binance (SPEC 4.1).
 MARKET_MIDDLE_COPY_SOURCE = f"{COPY_PREFIX}{PLATFORMS[0].capitalize()}"
 
-#: Spread keys that would hardcode what ``constants.UAH_SPREAD`` fixes. HARDCODED.
-HARDCODED_SPREAD_KEYS: tuple[str, ...] = ("spread", "min_spread", "spread_uah", "diff")
-HARDCODED_SPREAD_MESSAGE = "spread for fixed_spread scenarios is hardcoded per platform"
-
 #: Fallbacks used when a blueprint (or a pair) omits the amounts entirely.
 DEFAULT_MIN_AMOUNT = Decimal("1")
 DEFAULT_MAX_AMOUNT = Decimal("1000000")
 DEFAULT_PRICE_OFFSET = Decimal("0")
-
-#: Auto-linking of a non-anchor pair to the sibling anchor is defined for UAH (SPEC 4.1).
-AUTO_LINK_FIAT = "UAH"
 
 _TOP_LEVEL_KEYS = frozenset({"version", "name", "fiat", "strategy", "parser", "defaults", "pairs"})
 _PAIR_KEYS = frozenset(
@@ -204,7 +193,7 @@ def parse_blueprint(data: Mapping[str, Any]) -> Blueprint:
     parser = _parse_parser(data.get("parser"))
     defaults = _parse_defaults(data.get("defaults"))
     entries = _parse_pairs(data.get("pairs"), fiat, defaults)
-    plans = _resolve_pairs(entries, strategy)
+    plans = _resolve_pairs(entries)
     return Blueprint(
         name=name,
         fiat=fiat,
@@ -233,7 +222,7 @@ def load_blueprint(path: str | Path) -> Blueprint:
 
 
 def load_blueprint_by_name(name: str, scenarios_dir: str | Path = "scenarios") -> Blueprint:
-    """Load ``uah``/``uah.json`` (or a path) from ``scenarios_dir``."""
+    """Load ``pln``/``pln.json`` (or a path) from ``scenarios_dir``."""
     if not isinstance(name, str) or not name.strip():
         raise BlueprintError("scenario name must be a non-empty string")
     filename = Path(name.strip()).name
@@ -259,12 +248,6 @@ def _reject_unknown_keys(block: Mapping[str, Any], allowed: frozenset[str], wher
         raise BlueprintError(
             f"{where}: unknown key(s) {', '.join(unknown)}; expected one of: {expected}"
         )
-
-
-def _check_hardcoded_spread(block: Mapping[str, Any], where: str) -> None:
-    for key in HARDCODED_SPREAD_KEYS:
-        if key in block:
-            raise BlueprintError(f"{where}: {HARDCODED_SPREAD_MESSAGE}; remove the {key!r} key")
 
 
 def _parse_version(raw: Any) -> int:
@@ -384,7 +367,7 @@ def _parse_source_expression(raw: Any, where: str) -> str:
         raise BlueprintError(f"{where} must be a source expression, got {raw!r}")
     text = raw.strip()
     lowered = text.lower()
-    if lowered in (SOURCE_BASE_RATE, SOURCE_BASE_RATE_MINUS_SPREAD, SOURCE_MARKET_MIDDLE):
+    if lowered in (SOURCE_BASE_RATE, SOURCE_MARKET_MIDDLE):
         return lowered
     if lowered.startswith(COPY_PREFIX):
         platform = lowered[len(COPY_PREFIX) :].strip()
@@ -409,15 +392,12 @@ def _merge_filters(raw: Any, base_by_platform: Mapping[str, Filters], where: str
         return resolved
     if not isinstance(raw, Mapping):
         raise BlueprintError(f"{where} must be a JSON object mapping platform -> filter object")
-    _check_hardcoded_spread(raw, where)
     for platform_key, block in raw.items():
         platform = str(platform_key).strip().lower()
         if platform not in PLATFORMS:
             raise BlueprintError(
                 f"{where}: unknown platform {platform_key!r}; known platforms: {', '.join(PLATFORMS)}"
             )
-        if isinstance(block, Mapping):
-            _check_hardcoded_spread(block, f"{where}.{platform}")
         try:
             resolved[platform] = Filters.from_dict(block, base=resolved[platform])
         except ConfigError as exc:
@@ -440,7 +420,6 @@ def _parse_platforms(raw: Any, where: str) -> tuple[dict[str, str], dict[str, tu
             )
         if not isinstance(block, Mapping):
             raise BlueprintError(f"{where}.{platform} must be a JSON object")
-        _check_hardcoded_spread(block, f"{where}.{platform}")
         _reject_unknown_keys(block, _PLATFORM_KEYS, f"{where}.{platform}")
         if "source" in block:
             sources[platform] = _parse_source_expression(block["source"], f"{where}.{platform}.source")
@@ -515,7 +494,6 @@ def _parse_pairs(raw: Any, fiat: str, defaults: Defaults) -> list[_PairEntry]:
         where = f"pairs[{position}]"
         if not isinstance(item, Mapping):
             raise BlueprintError(f"{where} must be a JSON object")
-        _check_hardcoded_spread(item, where)
         _reject_unknown_keys(item, _PAIR_KEYS, where)
 
         pair = _parse_pair_symbol(item.get("pair"), where)
@@ -575,7 +553,7 @@ def _parse_pairs(raw: Any, fiat: str, defaults: Defaults) -> list[_PairEntry]:
     return entries
 
 
-def _resolve_pairs(entries: Sequence[_PairEntry], strategy: str) -> tuple[PairPlan, ...]:
+def _resolve_pairs(entries: Sequence[_PairEntry]) -> tuple[PairPlan, ...]:
     anchors = [entry for entry in entries if entry.anchor]
     anchor_symbols = {entry.pair.symbol for entry in anchors}
     declared_symbols = {entry.pair.symbol for entry in entries}
@@ -585,7 +563,7 @@ def _resolve_pairs(entries: Sequence[_PairEntry], strategy: str) -> tuple[PairPl
     for entry in ordered:
         linked_to = _linked_pair(entry, anchors, anchor_symbols, declared_symbols)
         platforms = _present_platforms(entry)
-        sources = _resolve_sources(entry, platforms, linked_to, strategy)
+        sources = _resolve_sources(entry, platforms)
         plans.append(
             PairPlan(
                 pair=entry.pair,
@@ -614,7 +592,7 @@ def _linked_pair(
     if entry.anchor:
         return None
     if entry.linked_symbol is None:
-        return _auto_linked_pair(entry.pair, anchors)
+        raise _missing_link(entry.pair, anchors)
 
     target = _parse_pair_symbol(entry.linked_symbol, f"pair {entry.pair.symbol}.linked_to")
     if target == entry.pair:
@@ -635,17 +613,16 @@ def _linked_pair(
     return target
 
 
-def _auto_linked_pair(pair: Pair, anchors: Sequence[_PairEntry]) -> Pair:
+def _missing_link(pair: Pair, anchors: Sequence[_PairEntry]) -> BlueprintError:
+    """The error for a non-anchor pair that declares no ``linked_to``."""
     candidates = [entry.pair for entry in anchors if entry.pair.fiat == pair.fiat]
-    if pair.fiat == AUTO_LINK_FIAT and len(candidates) == 1:
-        return candidates[0]
-    if len(candidates) > 1:
+    if candidates:
         symbols = ", ".join(candidate.symbol for candidate in candidates)
-        raise BlueprintError(
-            f"pair {pair.symbol} must declare 'linked_to': several anchor pairs trade "
-            f"{pair.fiat} ({symbols})"
+        return BlueprintError(
+            f"pair {pair.symbol} is not an anchor and must declare 'linked_to' "
+            f"(anchor pairs trading {pair.fiat}: {symbols})"
         )
-    raise BlueprintError(
+    return BlueprintError(
         f"pair {pair.symbol} is not an anchor and must declare 'linked_to' "
         f"(no {pair.fiat} anchor pair is available to link it to)"
     )
@@ -658,30 +635,13 @@ def _present_platforms(entry: _PairEntry) -> tuple[str, ...]:
     return tuple(platform for platform in PLATFORMS if platform in present)
 
 
-def _resolve_sources(
-    entry: _PairEntry,
-    platforms: Sequence[str],
-    linked_to: Pair | None,
-    strategy: str,
-) -> dict[str, str]:
-    if strategy == STRATEGY_MARKET_MIDDLE:
-        resolved = {
-            platform: (
-                MARKET_MIDDLE_COPY_SOURCE if platform == "bybit" else SOURCE_MARKET_MIDDLE
-            )
-            for platform in platforms
-        }
-    else:
-        anchor_source = SOURCE_BASE_RATE if entry.anchor else SOURCE_BASE_RATE_MINUS_SPREAD
-        resolved = {platform: anchor_source for platform in platforms}
+def _resolve_sources(entry: _PairEntry, platforms: Sequence[str]) -> dict[str, str]:
+    """``market_middle`` on Binance/OKX and ``copy:Binance`` on ByBit, then pair overrides."""
+    resolved = {
+        platform: MARKET_MIDDLE_COPY_SOURCE if platform == "bybit" else SOURCE_MARKET_MIDDLE
+        for platform in platforms
+    }
     resolved.update(entry.platform_sources)
-
-    for platform, source in resolved.items():
-        if source == SOURCE_BASE_RATE_MINUS_SPREAD and linked_to is None:
-            raise BlueprintError(
-                f"pair {entry.pair.symbol}: source {SOURCE_BASE_RATE_MINUS_SPREAD!r} for "
-                f"{platform} requires 'linked_to'"
-            )
 
     for platform, source in resolved.items():
         if not source.startswith(COPY_PREFIX):

@@ -6,20 +6,21 @@ Public surface::
 
 The layer depends on exactly ONE duck-typed façade object (SPEC 11.5, built by
 ``p2pbot.services.build_services``) and imports it only under ``if TYPE_CHECKING:``:
-``p2pbot.services`` / ``p2pbot.publisher`` / ``p2pbot.engine`` are never imported here, so
+``p2pbot.services`` / ``p2pbot.publisher`` are never imported here, so
 this package keeps working while those modules evolve.
 """
 
 from __future__ import annotations
 
-from .api import Message, TelegramAPI, TelegramApiError, Update, split_message
+from .api import CallbackQuery, Message, TelegramAPI, TelegramApiError, Update, split_message
 from .bot import BotRunner
-from .handlers import HELP_TEXT, Dispatcher, HandlerResult, render_results, render_snapshot
+from .handlers import HELP_TEXT, Dispatcher, HandlerResult
 from .security import AccessController, Decision, RateLimiter, audit, has_attachments, is_owner
 
 __all__ = [
     "AccessController",
     "BotRunner",
+    "CallbackQuery",
     "Decision",
     "Dispatcher",
     "HELP_TEXT",
@@ -32,7 +33,5 @@ __all__ = [
     "audit",
     "has_attachments",
     "is_owner",
-    "render_results",
-    "render_snapshot",
     "split_message",
 ]

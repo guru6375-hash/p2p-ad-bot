@@ -53,7 +53,6 @@ string (they are byte-identical).  If a future transport changes its encoding,
 Endpoints
 ~~~~~~~~~
 ===========================  ==================================================
-create                       ``POST /v5/p2p/item/create`` → ``result.itemId``
 update (repricing)           ``POST /v5/p2p/item/update`` + ``actionType: "MODIFY"``
 re-online                    ``POST /v5/p2p/item/update`` + ``actionType: "ACTIVE"``
 pause / take the ad down     ``POST /v5/p2p/item/cancel`` ``{"itemId": adv_no}``
@@ -61,8 +60,7 @@ list own ads                 ``POST /v5/p2p/item/personal/list`` (``size`` ≤ 3
 ===========================  ==================================================
 
 ``AdSpec.active`` mapping (Bybit has **no** offline/status-toggle endpoint — see
-``docs/research/bybit.md`` §Open questions 4): a *create* always publishes an active ad;
-``active=True`` **with a known id** keeps the ad running and pushes the new money fields
+``docs/research/bybit.md`` §Open questions 4): ``active=True`` keeps the ad running and pushes the new money fields
 (:data:`ACTION_MODIFY`); pass ``action_type=ACTION_ACTIVE`` to the same builder for the one
 documented re-online action when the venue has taken the ad offline; ``active=False`` calls
 ``cancel`` (:meth:`BybitAdapter.build_cancel_ad_request`), which *removes* the advertisement
@@ -96,11 +94,14 @@ is centralized, so a correction is a one-line edit.)
    ``["-1"]`` is used when :attr:`~p2pbot.models.AdSpec.payment_ids` is empty; the meaning of
    ``-1`` (and of the ids in ad responses) is not documented.  Real ids must be supplied by
    the caller; the venue accepts at most five.
-4. **``remark``**: documented as required with a 900-character limit; :class:`AdSpec` has no
-   remark field, so :meth:`BybitAdapter.build_remark` derives a deterministic one and
-   truncates it at :data:`REMARK_MAX_LENGTH`.
-5. **``tradingPreferenceSet``**: documented as required with only optional sub-flags, so an
-   empty object is sent.  Whether Bybit accepts ``{}`` is not documented.
+4. **``remark``, ``tradingPreferenceSet``, ``paymentPeriod``**: required on every update and
+   replaced by what is sent, so an update echoes the ad's own values from ``item/info``
+   (:data:`ECHOED_ITEM_FIELDS`). Whether ``item/update`` accepts the ``tradingPreferenceSet``
+   object exactly as ``item/info`` returns it is not documented.
+5. **``quantity`` on update** is the amount **left** on the ad (live-verified 2026-09-25:
+   an update sent with the listing's total ``quantity`` reset ``lastQuantity`` to that total,
+   adding back the executed amount). An edit that keeps the amount therefore sends
+   ``lastQuantity`` (:attr:`~p2pbot.models.OwnAd.total_quantity` carries it for Bybit).
 6. **``recentExecuteRate`` scale** (:func:`_normalize_rate`): the official sample shows ``0``,
    so the scale cannot be read off it; values above 1 are treated as percentages.
 7. **Numeric P2P ``ret_code`` values** are not published; the adapter only distinguishes
@@ -121,7 +122,19 @@ from typing import Any, ClassVar
 
 from ..constants import SIDE_BUY, SIDE_SELL
 from ..errors import ApiError, ConfigError
-from ..models import Account, AdActionResult, AdSpec, CompetitorAd, Pair, parse_decimal
+from ..models import (
+    AD_STATUS_CLOSED,
+    AD_STATUS_OFFLINE,
+    AD_STATUS_ONLINE,
+    AD_STATUS_UNKNOWN,
+    Account,
+    AdActionResult,
+    AdSpec,
+    CompetitorAd,
+    OwnAd,
+    Pair,
+    parse_decimal,
+)
 from .base import ExchangeAdapter, HttpRequest
 
 __all__ = ["BybitAdapter"]
@@ -143,10 +156,28 @@ SEARCH_ACTION = "recommend"
 #: V5 host; testnet is ``https://api-testnet.bybit.com`` (class-level, single switch).
 API_BASE = "https://api.bybit.com"
 
-CREATE_PATH = "/v5/p2p/item/create"
 UPDATE_PATH = "/v5/p2p/item/update"
 CANCEL_PATH = "/v5/p2p/item/cancel"
 LIST_PATH = "/v5/p2p/item/personal/list"
+ITEM_INFO_PATH = "/v5/p2p/item/info"
+#: Fields ``item/update`` requires and *replaces*: an update echoes the ad's own values.
+ECHOED_ITEM_FIELDS: tuple[str, ...] = ("remark", "tradingPreferenceSet", "paymentPeriod")
+#: The ``tradingPreferenceSet`` keys ``item/update`` documents, all typed as strings.
+#: ``item/info`` answers with numbers and extra keys, which the update rejects (10001).
+UPDATE_PREFERENCE_KEYS: tuple[str, ...] = (
+    "hasUnPostAd",
+    "isKyc",
+    "isEmail",
+    "isMobile",
+    "hasRegisterTime",
+    "registerTimeThreshold",
+    "orderFinishNumberDay30",
+    "completeRateDay30",
+    "nationalLimit",
+    "hasOrderFinishNumberDay30",
+    "hasCompleteRateDay30",
+    "hasNationalLimit",
+)
 
 #: Bybit encodes the *advertiser's* side: "1" = the advertiser sells, "0" = buys.
 SIDE_CODE_SELL = "1"
@@ -157,14 +188,22 @@ ACTION_ACTIVE = "ACTIVE"
 _ACTION_TYPES = (ACTION_MODIFY, ACTION_ACTIVE)
 
 PRICE_TYPE_FIXED = "0"
+#: ``priceType`` of a floating-price ad (priced by ``premium``); updates keep ads fixed.
+PRICE_TYPE_FLOATING = "1"
 PREMIUM_NONE = "0"
-ITEM_TYPE_ORIGIN = "ORIGIN"
 PAYMENT_PERIOD_MINUTES = "15"
-REMARK_MAX_LENGTH = 900
 LIST_PAGE_SIZE_MAX = 30
+#: ``status`` of a listed own ad (``10`` online, ``20`` offline, ``30`` completed).
+OWN_AD_STATUSES: dict[str, str] = {
+    "10": AD_STATUS_ONLINE,
+    "20": AD_STATUS_OFFLINE,
+    "30": AD_STATUS_CLOSED,
+}
+#: ``side`` of a listed own ad (an int on reads) -> side.
+OWN_AD_SIDES: dict[str, str] = {SIDE_CODE_SELL: SIDE_SELL, SIDE_CODE_BUY: SIDE_BUY}
 PAYMENT_IDS_MAX = 5
 
-#: UNCONFIRMED: ``["-1"]`` appears in the official create-ad example; its meaning (and how to
+#: UNCONFIRMED: ``["-1"]`` appears in Bybit's official post-ad example; its meaning (and how to
 #: obtain real ids) is undocumented, so it is only used when the caller supplies none.
 DEFAULT_PAYMENT_IDS: tuple[str, ...] = ("-1",)
 
@@ -181,10 +220,8 @@ UNCONFIRMED: tuple[str, ...] = (
     "BybitAdapter.parse_search_response (uses the documented V5 sample shape)",
     "paymentIds semantics; the sample value ['-1'] -> DEFAULT_PAYMENT_IDS / "
     "BybitAdapter._payment_ids",
-    "the 900-character remark limit and the derived remark text -> REMARK_MAX_LENGTH / "
-    "BybitAdapter.build_remark",
-    "whether Bybit accepts an empty tradingPreferenceSet -> build_create_ad_request / "
-    "build_update_ad_request",
+    "whether item/update accepts the tradingPreferenceSet object exactly as item/info "
+    "returns it -> ECHOED_ITEM_FIELDS / build_update_ad_request",
     "the recentExecuteRate scale -> _normalize_rate",
     "numeric P2P ret_code values -> BybitAdapter.ensure_success (the venue ret_msg is "
     "reported verbatim, no code table is invented)",
@@ -361,6 +398,9 @@ class BybitAdapter(ExchangeAdapter):
     #: Default ``page``/``size`` of :meth:`build_list_ads_request` (venue maximum is 30).
     list_page_size: ClassVar[int] = LIST_PAGE_SIZE_MAX
 
+    #: ``size`` of each :meth:`fetch_own_ads` page (the venue maximum).
+    own_ads_page_size: ClassVar[int] = LIST_PAGE_SIZE_MAX
+
     # -- clock -------------------------------------------------------------------------
     def timestamp_ms(self) -> str:
         """Milliseconds since the epoch for the *injected* clock, as the venue wants it.
@@ -475,34 +515,55 @@ class BybitAdapter(ExchangeAdapter):
         """``result.items`` of a ``personal/list`` payload (empty when there are none)."""
         return _result_items(payload)
 
-    # -- private: create ---------------------------------------------------------------
-    def build_create_ad_request(
-        self, account: Account, spec: AdSpec, adv_no: str | None = None
-    ) -> HttpRequest:
-        """Publish a new advertisement; the venue answers with ``result.itemId``.
-
-        ``adv_no`` is ignored: it is carried by :meth:`build_update_ad_request` only, and a
-        create always publishes an active ad (SPEC §9: any ``AdSpec.active`` is mapped by the
-        caller choosing create vs. update).
-        """
-        del adv_no  # a create has no id yet — Bybit returns it
+    def build_own_ads_request(self, account: Account, *, page: int) -> HttpRequest:
+        """One ``personal/list`` page with no token/currency/status filter: every own ad."""
         body = {
-            "tokenId": spec.pair.crypto,
-            "currencyId": spec.pair.fiat,
-            "side": _side_code(spec.side),
-            "priceType": PRICE_TYPE_FIXED,
-            "premium": PREMIUM_NONE,
-            "price": _money(spec.price),
-            "minAmount": _money(spec.min_amount),
-            "maxAmount": _money(spec.max_amount),
-            "remark": self.build_remark(spec),
-            "tradingPreferenceSet": {},
-            "paymentIds": list(self._payment_ids(spec)),
-            "quantity": _money(self._quantity(spec)),
-            "paymentPeriod": PAYMENT_PERIOD_MINUTES,
-            "itemType": ITEM_TYPE_ORIGIN,
+            "page": str(int(page)),
+            "size": str(min(int(self.own_ads_page_size), LIST_PAGE_SIZE_MAX)),
         }
-        return self._private_request(account, CREATE_PATH, body)
+        return self._private_request(account, LIST_PATH, body)
+
+    def parse_own_ad(self, row: Mapping[str, Any], account: Account) -> OwnAd | None:
+        """Normalize one ``result.items[]`` row of the own-ad listing."""
+        adv_no = _optional_text(row.get("id"))
+        try:
+            pair = Pair(
+                fiat=_optional_text(row.get("currencyId")) or "",
+                crypto=_optional_text(row.get("tokenId")) or "",
+            )
+        except ConfigError:
+            pair = None
+        if adv_no is None or pair is None:
+            _log.debug("bybit %s: skipped an own-ad row without id/tokenId/currencyId", account.id)
+            return None
+        venue_status = _optional_text(row.get("status")) or ""
+        payments = tuple(
+            text for text in map(_optional_text, _as_sequence(row.get("payments"))) if text
+        )
+        return OwnAd(
+            platform=self.platform,
+            account_id=account.id,
+            adv_no=adv_no,
+            pair=pair,
+            side=OWN_AD_SIDES.get(_optional_text(row.get("side")) or "", ""),
+            status=OWN_AD_STATUSES.get(venue_status, AD_STATUS_UNKNOWN),
+            price=_decimal(row.get("price"), "price"),
+            min_amount=_decimal(row.get("minAmount"), "minAmount"),
+            max_amount=_decimal(row.get("maxAmount"), "maxAmount"),
+            quantity=_decimal(row.get("lastQuantity"), "lastQuantity"),
+            payment_methods=payments,
+            venue_status=venue_status,
+            # item/update's quantity is the amount *left* on the ad (live-verified: sending the
+            # listing's total ``quantity`` reset ``lastQuantity`` to it), so an edit that keeps
+            # the amount must send ``lastQuantity``.
+            total_quantity=_decimal(row.get("lastQuantity"), "lastQuantity"),
+            price_floating_ratio=(
+                _decimal(row.get("premium"), "premium")
+                if _optional_text(row.get("priceType")) == PRICE_TYPE_FLOATING
+                else None
+            ),
+            payment_ids=_payment_term_ids(row),
+        )
 
     # -- private: update / re-online / pause -------------------------------------------
     def build_update_ad_request(
@@ -520,15 +581,25 @@ class BybitAdapter(ExchangeAdapter):
         ``active`` ``True`` with a known id is the ordinary repricing path (``MODIFY``); the
         only documented way back online is ``actionType: "ACTIVE"``
         (:data:`ACTION_ACTIVE`), which is what the caller passes for a re-list.
+
+        Bybit requires ``remark``, ``tradingPreferenceSet``, ``paymentPeriod`` and ``quantity``
+        on every update and *replaces* them with what is sent, so the ad's current item is
+        fetched first (``POST /v5/p2p/item/info``) and :data:`ECHOED_ITEM_FIELDS` are sent back
+        unchanged; only the spec's price, amounts, payment ids and quantity are written. Like
+        Binance's update, this builder therefore performs I/O, and it refuses to build a body
+        when the item lacks one of those fields rather than overwrite it with a default.
         """
         if not spec.active:
             return self.build_cancel_ad_request(account, adv_no)
+        if spec.price_floating_ratio is not None:
+            raise ConfigError("bybit: floating-price updates are not supported; pass a fixed price")
         resolved = str(action_type).strip().upper()
         if resolved not in _ACTION_TYPES:
             raise ConfigError(
                 f"unknown bybit update action {action_type!r}; expected one of "
                 f"{', '.join(_ACTION_TYPES)}"
             )
+        item = self._fetch_item(account, _adv_no_or_raise(adv_no))
         body = {
             "id": _adv_no_or_raise(adv_no),
             "actionType": resolved,
@@ -537,19 +608,66 @@ class BybitAdapter(ExchangeAdapter):
             "price": _money(spec.price),
             "minAmount": _money(spec.min_amount),
             "maxAmount": _money(spec.max_amount),
-            "remark": self.build_remark(spec),
-            "tradingPreferenceSet": {},
-            "paymentIds": list(self._payment_ids(spec)),
+            "remark": str(item["remark"]),
+            "tradingPreferenceSet": _update_preferences(item["tradingPreferenceSet"], adv_no),
+            "paymentIds": list(self._update_payment_ids(spec, item, adv_no)),
             "quantity": _money(self._quantity(spec)),
-            "paymentPeriod": PAYMENT_PERIOD_MINUTES,
+            "paymentPeriod": str(item["paymentPeriod"]),
         }
         return self._private_request(account, UPDATE_PATH, body)
+
+    def _update_payment_ids(
+        self, spec: AdSpec, item: Mapping[str, Any], adv_no: str
+    ) -> tuple[str, ...]:
+        """The account's own payment-method ids: the spec's, else the ad's ``paymentTerms``.
+
+        ``item/update`` wants the ids of the account's payment methods (``paymentTerms[].id``),
+        not the payment *type* ids of ``payments`` (those fail with ``912300013``). An ad that
+        reports none is refused rather than sent the documented sample ``["-1"]``, which would
+        replace its payment methods.
+        """
+        if spec.payment_ids:
+            return self._payment_ids(spec)
+        ids = _payment_term_ids(item)
+        if not ids:
+            raise ApiError(
+                f"bybit advertisement {adv_no} reports no payment methods (paymentTerms); "
+                "refusing to replace them"
+            )
+        if len(ids) > PAYMENT_IDS_MAX:
+            raise ConfigError(f"bybit accepts at most {PAYMENT_IDS_MAX} payment ids, got {len(ids)}")
+        return ids
+
+    def _fetch_item(self, account: Account, adv_no: str) -> Mapping[str, Any]:
+        """The ad's current ``item/info`` result, checked to carry :data:`ECHOED_ITEM_FIELDS`."""
+        payload = self.send_private(
+            account, self._private_request(account, ITEM_INFO_PATH, {"itemId": adv_no})
+        )
+        item = _result_mapping(payload)
+        if item is None:
+            raise ApiError(
+                f"bybit advertisement {adv_no} of account {account.id} has no detail object",
+                payload=payload,
+            )
+        missing = [
+            name
+            for name in ECHOED_ITEM_FIELDS
+            if item.get(name) is None
+            or (name == "tradingPreferenceSet" and not isinstance(item.get(name), Mapping))
+        ]
+        if missing:
+            raise ApiError(
+                f"bybit advertisement {adv_no} of account {account.id} lacks {', '.join(missing)}; "
+                "refusing to overwrite them with defaults",
+                payload=payload,
+            )
+        return item
 
     def build_cancel_ad_request(self, account: Account, adv_no: str) -> HttpRequest:
         """Take an advertisement down (``POST /v5/p2p/item/cancel``).
 
         Bybit has no offline endpoint: cancelling *removes* the advertisement, so a later
-        "resume" needs the re-online action (or a fresh create when the id is gone).  This is
+        "resume" needs the re-online action (or a new ad made on Bybit when the id is gone).  This is
         the request ``AdSpec.active is False`` maps to.
         """
         body = {"itemId": _adv_no_or_raise(adv_no)}
@@ -557,11 +675,11 @@ class BybitAdapter(ExchangeAdapter):
 
     # -- private: response -------------------------------------------------------------
     def parse_ad_response(self, payload: Any) -> AdActionResult:
-        """``adv_no`` (``result.itemId`` on a create) and ``raw``; nothing else is said.
+        """``adv_no`` (``result.itemId`` when echoed) and ``raw``; nothing else is said.
 
         ``parse_ad_result`` (base) fills platform/account/pair/price from the request context,
-        so the identity fields here are placeholders and ``price`` is ``None``: the create,
-        update and cancel payloads echo no price.
+        so the identity fields here are placeholders and ``price`` is ``None``: the update
+        and cancel payloads echo no price.
         """
         result = _result_mapping(payload)
         adv_no = _optional_text(result.get("itemId")) if result is not None else None
@@ -571,23 +689,10 @@ class BybitAdapter(ExchangeAdapter):
             pair=_UNKNOWN_PAIR,
             adv_no=adv_no,
             price=None,  # type: ignore[arg-type]  # base fills spec.price when it is None
-            created=False,
             raw=payload if isinstance(payload, Mapping) else {},
         )
 
     # -- spec helpers ------------------------------------------------------------------
-    def build_remark(self, spec: AdSpec) -> str:
-        """Free-text remark for the venue (UNCONFIRMED 900-character limit).
-
-        :class:`~p2pbot.models.AdSpec` carries no remark, so a deterministic one is derived
-        from the pair and the payment display names rather than inventing marketing text.
-        """
-        parts = [spec.pair.symbol]
-        methods = [str(method).strip() for method in spec.payment_methods if str(method).strip()]
-        if methods:
-            parts.append(", ".join(methods))
-        return " | ".join(parts)[:REMARK_MAX_LENGTH]
-
     def _payment_ids(self, spec: AdSpec) -> tuple[str, ...]:
         """``spec.payment_ids`` when present, else the documented sample ``["-1"]``.
 
@@ -674,6 +779,36 @@ class BybitAdapter(ExchangeAdapter):
             adv_no=_optional_text(item.get("id")),
             raw=item,
         )
+
+
+def _payment_term_ids(item: Mapping[str, Any]) -> tuple[str, ...]:
+    """``paymentTerms[].id`` of an ad: the account's own payment-method ids."""
+    ids = (
+        _optional_text(term.get("id"))
+        for term in _as_sequence(item.get("paymentTerms"))
+        if isinstance(term, Mapping)
+    )
+    return tuple(value for value in ids if value)
+
+
+def _update_preferences(preferences: Mapping[str, Any], adv_no: str) -> dict[str, str]:
+    """The live ``tradingPreferenceSet`` in the shape ``item/update`` accepts.
+
+    Documented keys keep their value, as strings (``0`` -> ``"0"``). An undocumented key
+    that holds a real setting (anything but ``0``/``""``/``None``) cannot be sent back, so
+    the update is refused instead of silently dropping that requirement.
+    """
+    for key, value in preferences.items():
+        if key not in UPDATE_PREFERENCE_KEYS and value not in (0, "0", "", None):
+            raise ConfigError(
+                f"bybit advertisement {adv_no} has trading preference {key}={value!r}, which "
+                "item/update cannot carry; refusing to drop it"
+            )
+    return {
+        key: "" if preferences[key] is None else str(preferences[key])
+        for key in UPDATE_PREFERENCE_KEYS
+        if key in preferences
+    }
 
 
 def _adv_no_or_raise(adv_no: str) -> str:

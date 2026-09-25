@@ -14,6 +14,7 @@ Design notes
 from __future__ import annotations
 
 import json
+import logging
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -30,7 +31,17 @@ from ..constants import (
 )
 from ..errors import ApiError, TransportError
 from ..market import build_snapshot
-from ..models import Account, AdActionResult, AdSpec, CompetitorAd, Filters, MarketSnapshot, Pair, utcnow
+from ..models import (
+    Account,
+    AdActionResult,
+    AdSpec,
+    CompetitorAd,
+    Filters,
+    MarketSnapshot,
+    OwnAd,
+    Pair,
+    utcnow,
+)
 
 __all__ = [
     "HttpRequest",
@@ -40,6 +51,8 @@ __all__ = [
     "ExchangeAdapter",
     "safe_json",
 ]
+
+_log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -176,6 +189,17 @@ def _lower_headers(headers: Any) -> dict[str, str]:
     return {str(key).lower(): str(value) for key, value in items}
 
 
+def _venue_reason(payload: Any) -> str:
+    """``" (code=..., msg=...)"`` from a venue error body, ``""`` when it names none."""
+    if not isinstance(payload, Mapping):
+        return ""
+    code = next((payload[key] for key in ("code", "ret_code", "error_code") if payload.get(key) not in (None, "")), None)
+    message = next((payload[key] for key in ("msg", "ret_msg", "message", "error_message") if payload.get(key)), None)
+    parts = [f"code={code}" if code is not None else "", f"msg={message}" if message else ""]
+    text = ", ".join(part for part in parts if part)
+    return f" ({text})" if text else ""
+
+
 class ExchangeAdapter(ABC):
     """Base class for the Binance / OKX / ByBit P2P adapters.
 
@@ -184,6 +208,11 @@ class ExchangeAdapter(ABC):
     """
 
     platform: ClassVar[str] = ""
+
+    #: Rows asked for per page by :meth:`fetch_own_ads`.
+    own_ads_page_size: ClassVar[int] = 100
+    #: Upper bound on the pages :meth:`fetch_own_ads` reads for one account.
+    own_ads_max_pages: ClassVar[int] = 50
 
     def __init__(
         self,
@@ -252,18 +281,12 @@ class ExchangeAdapter(ABC):
         """Request that lists this account's own advertisements for ``pair``."""
 
     @abstractmethod
-    def build_create_ad_request(
-        self, account: Account, spec: AdSpec, adv_no: str | None = None
-    ) -> HttpRequest:
-        """Request that publishes a new advertisement."""
-
-    @abstractmethod
     def build_update_ad_request(self, account: Account, spec: AdSpec, adv_no: str) -> HttpRequest:
         """Request that updates an existing advertisement."""
 
     @abstractmethod
     def parse_ad_response(self, payload: Any) -> AdActionResult:
-        """Normalize a private create/update payload.
+        """Normalize a private update payload.
 
         The returned record only needs to carry what the venue tells us (``adv_no`` from
         ``data``/``result.itemId``, an echoed ``price``, ``raw``); the identity fields are
@@ -277,19 +300,18 @@ class ExchangeAdapter(ABC):
         account: Account,
         pair: Pair,
         spec: AdSpec,
-        created: bool,
         adv_no: str | None = None,
     ) -> AdActionResult:
         """Bridge a venue payload to a fully identified :class:`AdActionResult`.
 
         Adapters with a richer payload shape may override this; the default completes the
-        identity fields (platform/account/pair/price/created) from the known request
+        identity fields (platform/account/pair/price) from the known request
         context so callers never have to patch them in. ``adv_no`` is the id the caller
         addressed; it is used when the venue's update response does not echo it.
 
         ``AdSpec.active`` is the single on/off control of the whole system: adapters map it
         onto whatever the venue offers (e.g. an ``updateStatus`` payload, an ``ACTIVE``
-        action, or a take-down request). A *create* request always publishes an active ad.
+        action, or a take-down request).
         """
         parsed = self.parse_ad_response(payload)
         return AdActionResult(
@@ -298,7 +320,6 @@ class ExchangeAdapter(ABC):
             pair=pair,
             adv_no=parsed.adv_no or adv_no,
             price=parsed.price if parsed.price is not None else spec.price,
-            created=created,
             raw=parsed.raw,
         )
 
@@ -309,7 +330,8 @@ class ExchangeAdapter(ABC):
         payload = safe_json(response)
         if response.status >= 400:
             raise ApiError(
-                f"{self.platform} request for account {account.id} failed with HTTP {response.status}",
+                f"{self.platform} request for account {account.id} failed with HTTP "
+                f"{response.status}{_venue_reason(payload)}",
                 payload=payload,
                 status=response.status,
             )
@@ -320,6 +342,51 @@ class ExchangeAdapter(ABC):
         """List this account's advertisements for ``pair`` (raw venue records)."""
         payload = self.send_private(account, self.build_list_ads_request(account, pair))
         return self.parse_ad_list(payload)
+
+    def fetch_own_ads(self, account: Account) -> tuple[OwnAd, ...]:
+        """Every advertisement of ``account`` on this venue: all pairs, online or not.
+
+        Pages are read until one comes back empty, adds nothing new (a venue ignoring the
+        page number), or is shorter than both the requested size and the pages before it, or
+        until :attr:`own_ads_max_pages` is reached. A venue may silently cap the page size
+        (Binance returns 20 rows when asked for 100), so a page shorter than requested only
+        ends the listing once it is also shorter than the earlier pages. Rows the adapter
+        cannot identify are skipped; the same ``adv_no`` is listed once.
+        """
+        ads: list[OwnAd] = []
+        seen: set[str] = set()
+        longest = 0
+        for page in range(1, self.own_ads_max_pages + 1):
+            payload = self.send_private(account, self.build_own_ads_request(account, page=page))
+            rows = self.parse_ad_list(payload)
+            added = 0
+            for row in rows:
+                ad = self.parse_own_ad(row, account)
+                if ad is None or ad.adv_no in seen:
+                    continue
+                seen.add(ad.adv_no)
+                ads.append(ad)
+                added += 1
+            if not rows or not added:
+                return tuple(ads)
+            if len(rows) < self.own_ads_page_size and len(rows) < longest:
+                return tuple(ads)
+            longest = max(longest, len(rows))
+        _log.warning(
+            "%s own-ad listing of %s stopped after %d pages; later ads are not listed",
+            self.platform,
+            account.id,
+            self.own_ads_max_pages,
+        )
+        return tuple(ads)
+
+    @abstractmethod
+    def build_own_ads_request(self, account: Account, *, page: int) -> HttpRequest:
+        """One page of the listing of every own advertisement, across pairs and states."""
+
+    @abstractmethod
+    def parse_own_ad(self, row: Mapping[str, Any], account: Account) -> OwnAd | None:
+        """Normalize one own-ad listing row, or ``None`` when it cannot be identified."""
 
     def parse_ad_list(self, payload: Any) -> tuple[Mapping[str, Any], ...]:
         """Extract the raw advertisement records from a list payload.

@@ -317,11 +317,60 @@ def settings(env_factory: Callable[..., dict[str, str]]) -> Any:
     return load_settings(env_path=None, env=env_factory(), dotenv=False)
 
 
-@pytest.fixture
-def uah_blueprint() -> Any:
-    from p2pbot.blueprint import load_blueprint
+BASE_RATE_SCENARIO = "base_rate"
 
-    return load_blueprint(SCENARIOS_DIR / "uah.json")
+
+def base_rate_scenario_data(name: str = BASE_RATE_SCENARIO) -> dict[str, Any]:
+    """A valid UAH ``market_middle`` scenario priced entirely from stored base rates.
+
+    Every platform of both pairs overrides its source to ``base_rate`` and the parser is
+    disabled, so the scenario has no market sources at all. Tests that need base_rate
+    pricing or "a scenario without market sources" use it (the shipped ``pln.json`` is
+    market-driven).
+    """
+    accounts = ["Binance#1", "Binance#2", "Okx#1", "Bybit#1"]
+
+    def platforms() -> dict[str, dict[str, str]]:
+        return {platform: {"source": "base_rate"} for platform in ("binance", "okx", "bybit")}
+
+    return {
+        "version": 1,
+        "name": name,
+        "fiat": "UAH",
+        "strategy": "market_middle",
+        "parser": {"enabled": False, "interval_minutes": 25},
+        "defaults": {
+            "min_amount": "1000",
+            "max_amount": "200000",
+            "payment_methods": ["Monobank", "PrivatBank"],
+            "price_offset": "0",
+        },
+        "pairs": [
+            {"pair": "UAH/USDT", "anchor": True, "accounts": list(accounts), "platforms": platforms()},
+            {
+                "pair": "UAH/USDC",
+                "anchor": False,
+                "linked_to": "UAH/USDT",
+                "accounts": list(accounts),
+                "platforms": platforms(),
+            },
+        ],
+    }
+
+
+def write_base_rate_scenario(directory: Path, name: str = BASE_RATE_SCENARIO) -> Path:
+    """Write :func:`base_rate_scenario_data` as ``<directory>/<name>.json``."""
+    directory.mkdir(parents=True, exist_ok=True)
+    target = directory / f"{name}.json"
+    target.write_text(json.dumps(base_rate_scenario_data(name), indent=2), encoding="utf-8")
+    return target
+
+
+@pytest.fixture
+def base_rate_blueprint() -> Any:
+    from p2pbot.blueprint import parse_blueprint
+
+    return parse_blueprint(base_rate_scenario_data())
 
 
 @pytest.fixture
@@ -332,177 +381,48 @@ def pln_blueprint() -> Any:
 
 
 # --------------------------------------------------------------------------------------
-# stub façade matching docs/SPEC.md 11.5 (Telegram tests own this shape)
+# stub façade (Telegram tests own this shape)
 # --------------------------------------------------------------------------------------
-@dataclass(frozen=True)
-class StubPublishResult:
-    account_id: str
-    platform: str
-    pair: str
-    status: str
-    price: Decimal | None = None
-    adv_no: str | None = None
-    error: str | None = None
-    dry_run: bool = False
-
-
-@dataclass(frozen=True)
-class StubRateRow:
-    pair: str
-    base: Decimal | None
-    cap: Decimal | None
-
-
-@dataclass(frozen=True)
-class StubMarketRow:
-    platform: str
-    pair: str
-    middle: Decimal | None
-    filtered: int
-    fetched_at: datetime | None
-
-
-@dataclass(frozen=True)
-class StubJobRow:
-    name: str
-    next_run_at: datetime | None
-    last_error: str | None
-
-
-@dataclass(frozen=True)
-class StubStatusSnapshot:
-    version: str
-    scenario: str | None
-    fiat: str | None
-    strategy: str | None
-    rates: tuple[StubRateRow, ...] = ()
-    prices: tuple[Any, ...] = ()
-    market: tuple[StubMarketRow, ...] = ()
-    jobs: tuple[StubJobRow, ...] = ()
-    last_publish: tuple[StubPublishResult, ...] = ()
-    engine_error: str | None = None
-    engine_problems: tuple[str, ...] = ()
-
-
-@dataclass
-class StubScenario:
-    """Minimal blueprint stand-in: the handler only reads name/fiat/strategy/pairs."""
-
-    name: str
-    fiat: str = "UAH"
-    strategy: str = "fixed_spread"
-    pairs: tuple[Any, ...] = ()
-
-
-class StubScenarioManager:
-    """Duck-typed ``ScenarioManager``: records calls, no filesystem unless asked."""
-
-    def __init__(self, names: Sequence[str] = ("uah", "pln"), active: str | None = None) -> None:
-        self._names = tuple(names)
-        self._active = active
-        self.activated: list[str] = []
-        self.activate_error: BaseException | None = None
-        self.blueprint_error: BaseException | None = None
-
-    def available(self) -> tuple[str, ...]:
-        return self._names
-
-    def active_name(self) -> str | None:
-        return self._active
-
-    def activate(self, name: str) -> StubScenario:
-        if self.activate_error is not None:
-            raise self.activate_error
-        if name not in self._names:
-            from p2pbot.errors import BlueprintError
-
-            raise BlueprintError(f"unknown scenario {name!r}")
-        self.activated.append(name)
-        self._active = name
-        return StubScenario(name=name, pairs=(object(), object()))
-
-    def blueprint(self) -> StubScenario:
-        if self.blueprint_error is not None:
-            raise self.blueprint_error
-        if self._active is None:
-            from p2pbot.errors import ConfigError
-
-            raise ConfigError("no active scenario; available: none")
-        return StubScenario(name=self._active)
-
-    def reload(self) -> StubScenario:
-        return self.blueprint()
-
-
 class StubServices:
-    """The SPEC 11.5 façade, stubbed for Telegram tests (never talks to a venue)."""
+    """The bot façade, stubbed for Telegram tests (never talks to a venue)."""
 
     def __init__(
         self,
         settings: Any,
         *,
         clock: Callable[[], datetime] | None = None,
-        scenarios: StubScenarioManager | None = None,
         version: str = "1.0.0",
-        default_parser_interval: int = 25,
     ) -> None:
-        from p2pbot.market import MarketStore
-        from p2pbot.rates import RateStore
-        from p2pbot.scheduler import Scheduler
-
         self.settings = settings
         self.version = version
         self.clock = clock or FakeClock()
-        self.rates = RateStore()
-        self.market = MarketStore()
-        self.scheduler = Scheduler(self.clock)
-        self.scenarios = scenarios if scenarios is not None else StubScenarioManager()
-        self.default_parser_interval = default_parser_interval
+        self.uah_steps = {"binance": Decimal("0.25"), "bybit": Decimal("0.01")}
 
-        # recorded calls
-        self.publish_calls: list[dict[str, Any]] = []
-        self.active_calls: list[dict[str, Any]] = []
-        self.parser_calls: list[dict[str, Any]] = []
+        # recorded calls: {"market": "uah"|"pln", "rate": ..., "dry_run": ...}
+        self.setrate_calls: list[dict[str, Any]] = []
 
         # scripted outcomes
-        self.publish_results: tuple[StubPublishResult, ...] = ()
-        self.parser_results: tuple[Any, ...] = ()
-        self.active_results: tuple[StubPublishResult, ...] = ()
-        self.publish_error: BaseException | None = None
-        self.parser_error: BaseException | None = None
-        self.active_error: BaseException | None = None
-        self.snapshot_override: StubStatusSnapshot | None = None
+        self.setrate_report: Any = types.SimpleNamespace(
+            queued=(), unchanged=(), results=(), problems=()
+        )
+        self.setrate_error: BaseException | None = None
+        self.own_ads: tuple[Any, ...] = ()
 
     # -- façade operations ----------------------------------------------------------
-    def refresh_prices(self, *, dry_run: bool = False) -> tuple[StubPublishResult, ...]:
-        self.publish_calls.append({"dry_run": dry_run})
-        if self.publish_error is not None:
-            raise self.publish_error
-        return self.publish_results
+    def get_own_ads(self) -> tuple[Any, ...]:
+        return self.own_ads
 
-    def set_active(
-        self, active: bool, pairs: Iterable[str] | None = None
-    ) -> tuple[StubPublishResult, ...]:
-        self.active_calls.append({"active": active, "pairs": None if pairs is None else list(pairs)})
-        if self.active_error is not None:
-            raise self.active_error
-        return self.active_results
+    def _set_rate(self, market: str, rate: Decimal, dry_run: bool) -> Any:
+        self.setrate_calls.append({"market": market, "rate": rate, "dry_run": dry_run})
+        if self.setrate_error is not None:
+            raise self.setrate_error
+        return self.setrate_report
 
-    def run_parser(self, pairs: Iterable[str] | None = None) -> tuple[Any, ...]:
-        self.parser_calls.append({"pairs": None if pairs is None else list(pairs)})
-        if self.parser_error is not None:
-            raise self.parser_error
-        return self.parser_results
+    def set_uah_rate(self, rate: Decimal, *, dry_run: bool = False) -> Any:
+        return self._set_rate("uah", rate, dry_run)
 
-    def snapshot(self) -> StubStatusSnapshot:
-        if self.snapshot_override is not None:
-            return self.snapshot_override
-        return StubStatusSnapshot(
-            version=self.version,
-            scenario=self.scenarios.active_name(),
-            fiat=None,
-            strategy=None,
-        )
+    def set_pln_rate(self, rate: Decimal, *, dry_run: bool = False) -> Any:
+        return self._set_rate("pln", rate, dry_run)
 
 
 @pytest.fixture
@@ -581,7 +501,6 @@ __all__ = [
     "SERVICES_READY",
     "StubJobRow",
     "StubMarketRow",
-    "StubPublishResult",
     "StubRateRow",
     "StubScenario",
     "StubScenarioManager",

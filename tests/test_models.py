@@ -251,6 +251,7 @@ def test_ad_spec_defaults_and_serialisation() -> None:
         "side": "sell",
         "quantity": None,
         "payment_ids": [],
+        "price_floating_ratio": None,
     }
 
 
@@ -276,10 +277,8 @@ def test_ad_action_result_keeps_venue_payload() -> None:
         pair=Pair.parse("UAH/USDT"),
         adv_no="2048",
         price=Decimal("47.00"),
-        created=True,
         raw={"code": "000000"},
     )
-    assert result.created is True
     assert result.raw["code"] == "000000"
 
 
@@ -299,7 +298,7 @@ def test_ad_record_round_trip() -> None:
 
 def test_publish_result_ok_matrix() -> None:
     base = {"account_id": "Binance#1", "platform": "binance", "pair": Pair.parse("UAH/USDT")}
-    assert PublishResult(status="created", **base).ok
+    assert not PublishResult(status="created", **base).ok  # the bot never creates ads
     assert PublishResult(status="updated", **base).ok
     assert PublishResult(status="skipped", **base).ok
     assert PublishResult(status="dry_run", price=Decimal("47.00"), dry_run=True, **base).ok
@@ -327,7 +326,7 @@ def test_computed_ad_to_dict_exposes_source_and_clamp_flag() -> None:
         pair=Pair.parse("UAH/USDC"),
         platform="binance",
         price=Decimal("46.50"),
-        source="base_rate_minus_spread",
+        source="market_middle",
         cap=Decimal("46.50"),
         accounts=("Binance#1", "Binance#2"),
         base=Decimal("47.00"),
@@ -337,7 +336,7 @@ def test_computed_ad_to_dict_exposes_source_and_clamp_flag() -> None:
         "pair": "UAH/USDC",
         "platform": "binance",
         "price": "46.50",
-        "source": "base_rate_minus_spread",
+        "source": "market_middle",
         "cap": "46.50",
         "base": "47.00",
         "clamped": True,

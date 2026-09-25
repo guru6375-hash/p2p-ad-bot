@@ -19,10 +19,8 @@ import pytest
 from p2pbot.errors import ApiError, ConfigError, TransportError
 from p2pbot.exchanges.base import HttpRequest
 from p2pbot.exchanges.binance import (  # noqa: F401
-    ADS_CONDITION_DEFAULTS,
     ADS_DETAIL_PATH,
     ADS_LIST_PATH,
-    ADS_POST_PATH,
     ADS_UPDATE_PATH,
     ADS_UPDATE_STATUS_PATH,
     PAY_METHODS_PATH,
@@ -39,13 +37,19 @@ from _fake_transport import (
     FixedClock,
     json_response,
     make_account,
-    make_spec,
     text_response,
 )
+from _fake_transport import make_spec as _make_spec
 
 BINANCE = "https://api.binance.com"
 UAH_USDT = Pair.parse("UAH/USDT")
 ACCOUNT = make_account("binance", 1, BINANCE_CREDENTIALS)
+
+
+def make_spec(**kwargs: Any) -> Any:
+    """The shared spec builder, defaulting to a **buy** ad: Binance updates only buy ads."""
+    kwargs.setdefault("side", "buy")
+    return _make_spec(**kwargs)
 OTHER_ACCOUNT = make_account("binance", 2, BINANCE_CREDENTIALS)
 
 #: Real trimmed body of ``POST .../friendly/c2c/adv/search`` (Wayback 2026-09-04T14:49:48Z).
@@ -177,7 +181,7 @@ AD_DETAIL_PAYLOAD: dict[str, Any] = {
     "message": None,
     "data": {
         "advNo": "13928301035093368832",
-        "tradeType": "SELL",
+        "tradeType": "BUY",
         "asset": "USDT",
         "fiatUnit": "UAH",
         "priceType": 1,
@@ -215,26 +219,9 @@ LIST_ADS_PAYLOAD: dict[str, Any] = {
 }
 
 
-def assert_trade_methods(request, expected, *, sell=True):
-    """Pin the venue contract of ``tradeMethods``.
-
-    Sell entries must carry Binance's full method object (``identifier``/``payId``/
-    ``payType`` plus the display fields); an abbreviated body is rejected live with
-    ``-1000 System abnormality``. Buy entries address methods by ``identifier`` only.
-    """
-    entries = request.json_body["tradeMethods"]
-    assert len(entries) == len(expected)
-    for entry, core in zip(entries, expected):
-        assert {key: entry[key] for key in core} == core
-        if sell:
-            assert set(entry) == {
-                "identifier", "payId", "payType", "payAccount", "payBank", "paySubBank",
-                "tradeMethodName",
-            }
-            assert isinstance(entry["identifier"], str) and entry["identifier"]
-            assert isinstance(entry["tradeMethodName"], str) and entry["tradeMethodName"]
-        else:
-            assert set(entry) == {"identifier"}
+def assert_trade_methods(request, expected):
+    """Pin the venue contract of ``tradeMethods``: buy entries carry ``identifier`` only."""
+    assert request.json_body["tradeMethods"] == expected
 
 
 def _item(
@@ -692,88 +679,73 @@ def test_status_request_stringifies_a_numeric_adv_no() -> None:
 
 
 # --------------------------------------------------------------------------------------
-# private requests: create
+# private requests: update - payment methods, quantity and side of the ad body
 # --------------------------------------------------------------------------------------
-def test_create_request_resolves_the_pay_id_from_the_accounts_own_methods() -> None:
-    transport = FakeTransport(json_response(PAY_METHODS_PAYLOAD))
+ADV_NO = "13928301035093368832"
+
+
+def detail_response() -> Any:
+    """The ``getDetailByNo`` answer every active update fetches before building its body."""
+    return json_response(AD_DETAIL_PAYLOAD)
+
+
+def test_update_resolves_a_method_name_with_a_signed_lookup_of_the_accounts_methods() -> None:
+    transport = FakeTransport(detail_response(), json_response(PAY_METHODS_PAYLOAD))
     adapter = BinanceAdapter(transport, now=FixedClock())
-    spec = make_spec(
-        price="47.00", min_amount="1000.00", max_amount="47000.00", payment_methods=("Bank Transfer",)
+
+    request = adapter.build_update_ad_request(
+        ACCOUNT, make_spec(payment_methods=("Bank Transfer",)), ADV_NO
     )
 
-    request = adapter.build_create_ad_request(ACCOUNT, spec)
-
-    # The pay-method lookup is the only request the *builder* sends.
-    assert len(transport) == 1
-    pay_request = transport.last
+    pay_request = transport.requests[1]
     assert pay_request.method == "GET"
     assert pay_request.url == f"{BINANCE}{PAY_METHODS_PATH}"
     assert pay_request.json_body is None
     assert pay_request.headers == {"X-MBX-APIKEY": "binance-key"}
     signed_params(pay_request)
-
-    assert request.method == "POST"
-    assert request.url == f"{BINANCE}{ADS_POST_PATH}"
-    assert request.headers["Content-Type"] == "application/json"
-    body = request.json_body
-    # Binance rejects an abbreviated create body live (-1000 System abnormality), so the
-    # full field set of its own web client is required; the adapter must send all of it.
-    assert set(body) == set(ADS_CONDITION_DEFAULTS) | {
-        "classify", "tradeType", "asset", "fiatUnit", "priceType", "price", "initAmount",
-        "maxSingleTransAmount", "minSingleTransAmount", "buyerKycLimit", "tradeMethods",
-        "onlineNow", "payTimeLimit",
-    }
-    assert body["classify"] == "profession"  # merchant accounts: "mass" is refused
-    assert body["tradeType"] == "SELL"           # the ad endpoints take words, not 1/0
-    assert body["asset"] == "USDT" and body["fiatUnit"] == "UAH"
-    assert body["priceType"] == 1
-    assert body["price"] == "47.00"
-    assert body["initAmount"] == "1000.00"
-    assert body["maxSingleTransAmount"] == "47000.00"
-    assert body["minSingleTransAmount"] == "1000.00"
-    assert body["buyerKycLimit"] == 1
-    assert body["onlineNow"] is True
-    assert body["payTimeLimit"] == 15
-    # condition fields travel as the venue's own "no restriction" values
-    assert body["visible"] == 1 and body["allowTradeMerchant"] == 1
-    assert body["nonTradableRegions"] == [] and body["remarks"] == ""
-    assert body["buyerRegDaysLimit"] == -1 and body["userTradeVolumeMax"] == 1000000
-    assert_trade_methods(request, [{"payId": 1, "payType": "BANK"}])
-    signed_params(request)
+    assert_trade_methods(request, [{"identifier": "BANK"}])
 
 
-def test_create_request_reuses_the_cached_payment_methods_and_dedupes_entries() -> None:
-    transport = FakeTransport(json_response(PAY_METHODS_PAYLOAD))
+def test_update_reuses_the_cached_payment_methods_and_dedupes_entries() -> None:
+    transport = FakeTransport(
+        detail_response(), json_response(PAY_METHODS_PAYLOAD), detail_response()
+    )
     adapter = BinanceAdapter(transport, now=FixedClock())
-    # Both spellings resolve to the very same account payment method.
-    spec = make_spec(payment_methods=("Bank Transfer", "bank transfer"), payment_ids=("1",))
+    # Both spellings and the explicit identifier name the very same payment method.
+    spec = make_spec(payment_methods=("Bank Transfer", "bank transfer"), payment_ids=("BANK",))
 
-    first = adapter.build_create_ad_request(ACCOUNT, spec)
-    second = adapter.build_create_ad_request(ACCOUNT, spec)
+    first = adapter.build_update_ad_request(ACCOUNT, spec, ADV_NO)
+    second = adapter.build_update_ad_request(ACCOUNT, spec, ADV_NO)
 
-    assert len(transport) == 1  # one lookup for (account, fiat), reused afterwards
-    assert_trade_methods(first, [{"payId": 1, "payType": "BANK"}])
-    assert_trade_methods(second, [{"payId": 1, "payType": "BANK"}])
+    assert len(transport) == 3  # two details, one lookup for (account, fiat) reused afterwards
+    assert_trade_methods(first, [{"identifier": "BANK"}])
+    assert_trade_methods(second, [{"identifier": "BANK"}])
 
 
-def test_create_request_matches_methods_by_substring_and_by_pay_id() -> None:
-    transport = FakeTransport(json_response(PAY_METHODS_PAYLOAD))
+def test_update_matches_names_by_substring_and_sends_ids_verbatim() -> None:
+    transport = FakeTransport(
+        detail_response(), json_response(PAY_METHODS_PAYLOAD), detail_response(), detail_response()
+    )
     adapter = BinanceAdapter(transport, now=FixedClock())
 
-    by_name = adapter.build_create_ad_request(ACCOUNT, make_spec(payment_methods=("PrivatBank",)))
-    assert_trade_methods(by_name, [{"payId": 4, "payType": "PrivatBank"}])
+    by_name = adapter.build_update_ad_request(
+        ACCOUNT, make_spec(payment_methods=("PrivatBank",)), ADV_NO
+    )
+    assert_trade_methods(by_name, [{"identifier": "PrivatBank"}])
 
     # No display name equals "Transfer", so this is the documented loose (substring) fallback.
-    loose = adapter.build_create_ad_request(ACCOUNT, make_spec(payment_methods=("Transfer",)))
-    assert_trade_methods(loose, [{"payId": 1, "payType": "BANK"}])
+    loose = adapter.build_update_ad_request(ACCOUNT, make_spec(payment_methods=("Transfer",)), ADV_NO)
+    assert_trade_methods(loose, [{"identifier": "BANK"}])
 
-    by_id = adapter.build_create_ad_request(ACCOUNT, make_spec(payment_ids=("2", "3", "acct-9")))
+    by_id = adapter.build_update_ad_request(
+        ACCOUNT, make_spec(payment_ids=("2", "3", "acct-9")), ADV_NO
+    )
     assert_trade_methods(
         by_id,
         [
-            {"payId": 2, "payType": "BankTransferMena"},
-            {"payId": 3, "payType": "Monobank"},
-            {"payId": "acct-9", "payType": "Cash"},  # a non-numeric payId stays a string
+            {"identifier": "2"},
+            {"identifier": "3"},
+            {"identifier": "acct-9"},
         ],
     )
 
@@ -785,100 +757,90 @@ def test_create_request_matches_methods_by_substring_and_by_pay_id() -> None:
             {"payment_methods": ("Wise",)},
             "binance: account Binance#1 has no payment method matching 'Wise' for UAH/USDT",
         ),
-        (
-            {"payment_ids": ("99",)},
-            "binance: account Binance#1 has no payment method with payId '99' for UAH/USDT",
-        ),
     ],
 )
-def test_create_request_rejects_an_unresolvable_payment_method(
+def test_update_rejects_an_unresolvable_payment_method(
     spec_kwargs: dict[str, Any], message: str
 ) -> None:
-    transport = FakeTransport(json_response(PAY_METHODS_PAYLOAD))
+    transport = FakeTransport(detail_response(), json_response(PAY_METHODS_PAYLOAD))
     adapter = BinanceAdapter(transport, now=FixedClock())
 
     with pytest.raises(ApiError) as excinfo:
-        adapter.build_create_ad_request(ACCOUNT, make_spec(**spec_kwargs))
+        adapter.build_update_ad_request(ACCOUNT, make_spec(**spec_kwargs), ADV_NO)
 
     assert str(excinfo.value) == message
 
 
-def test_create_request_refuses_an_ad_without_any_payment_method() -> None:
-    transport = FakeTransport()
+def test_update_refuses_payment_methods_that_are_all_blank() -> None:
+    transport = FakeTransport(detail_response())
     adapter = BinanceAdapter(transport, now=FixedClock())
 
     with pytest.raises(ApiError) as excinfo:
-        adapter.build_create_ad_request(ACCOUNT, make_spec())
+        adapter.build_update_ad_request(ACCOUNT, make_spec(payment_methods=(" ",)), ADV_NO)
 
     assert str(excinfo.value) == (
         "binance: account Binance#1 has no payment method configured for UAH/USDT; "
-        "a sell advertisement cannot be published without one"
+        "a buy advertisement cannot be published without one"
     )
-    assert len(transport) == 0  # nothing is sent when the ad cannot be published
-
-
-def test_a_sell_method_without_a_pay_id_is_refused() -> None:
-    payload = {"code": "000000", "data": [{"payType": "BANK", "tradeMethodName": "Bank Transfer"}]}
-    adapter = BinanceAdapter(FakeTransport(json_response(payload)), now=FixedClock())
-
-    with pytest.raises(ApiError) as excinfo:
-        adapter.build_create_ad_request(ACCOUNT, make_spec(payment_methods=("Bank Transfer",)))
-
-    assert "carries no payId; it cannot be used on a sell advertisement" in str(excinfo.value)
+    assert len(transport) == 1  # only the detail; no lookup and no update is sent
 
 
 def test_buy_ads_address_payment_methods_by_identifier_without_a_lookup() -> None:
-    transport = FakeTransport()
+    transport = FakeTransport(detail_response())
     adapter = BinanceAdapter(transport, now=FixedClock())
 
-    request = adapter.build_create_ad_request(
-        ACCOUNT, make_spec(side="buy", payment_ids=("BANK", "BankTransferMena"))
+    request = adapter.build_update_ad_request(
+        ACCOUNT, make_spec(side="buy", payment_ids=("BANK", "BankTransferMena")), ADV_NO
     )
 
-    assert len(transport) == 0  # supplied identifiers are used verbatim
+    assert len(transport) == 1  # only the detail: supplied identifiers are used verbatim
     assert request.json_body["tradeType"] == "BUY"
     assert_trade_methods(
-        request, [{"identifier": "BANK"}, {"identifier": "BankTransferMena"}], sell=False
+        request, [{"identifier": "BANK"}, {"identifier": "BankTransferMena"}]
     )
 
 
 def test_buy_ads_resolve_display_names_against_the_own_methods() -> None:
-    transport = FakeTransport(json_response(PAY_METHODS_PAYLOAD))
+    transport = FakeTransport(detail_response(), json_response(PAY_METHODS_PAYLOAD))
     adapter = BinanceAdapter(transport, now=FixedClock())
 
-    request = adapter.build_create_ad_request(
-        ACCOUNT, make_spec(side="buy", payment_methods=("Bank Transfer", "Monobank"))
+    request = adapter.build_update_ad_request(
+        ACCOUNT, make_spec(side="buy", payment_methods=("Bank Transfer", "Monobank")), ADV_NO
     )
 
-    assert len(transport) == 1
+    assert len(transport) == 2
     assert_trade_methods(
-        request, [{"identifier": "BANK"}, {"identifier": "Monobank"}], sell=False
+        request, [{"identifier": "BANK"}, {"identifier": "Monobank"}]
     )
 
 
 def test_a_buy_method_without_identifier_pay_type_or_pay_id_is_refused() -> None:
     payload = {"code": "000000", "data": [{"tradeMethodName": "Cash only"}]}
-    adapter = BinanceAdapter(FakeTransport(json_response(payload)), now=FixedClock())
+    adapter = BinanceAdapter(
+        FakeTransport(detail_response(), json_response(payload)), now=FixedClock()
+    )
 
     with pytest.raises(ApiError) as excinfo:
-        adapter.build_create_ad_request(
-            ACCOUNT, make_spec(side="buy", payment_methods=("Cash only",))
+        adapter.build_update_ad_request(
+            ACCOUNT, make_spec(side="buy", payment_methods=("Cash only",)), ADV_NO
         )
 
     assert "carries no identifier; it cannot be used on a buy advertisement" in str(excinfo.value)
 
 
-def test_create_request_derives_the_quantity_from_max_amount_over_price() -> None:
-    transport = FakeTransport(json_response(PAY_METHODS_PAYLOAD))
+def test_update_derives_the_quantity_from_max_amount_over_price() -> None:
+    transport = FakeTransport(
+        detail_response(), json_response(PAY_METHODS_PAYLOAD), detail_response()
+    )
     adapter = BinanceAdapter(transport, now=FixedClock())
 
-    derived = adapter.build_create_ad_request(
+    derived = adapter.build_update_ad_request(
         ACCOUNT,
         make_spec(price="47.00", max_amount="1000.00", payment_methods=("Bank Transfer",)),
+        ADV_NO,
     )
-    explicit = adapter.build_create_ad_request(
-        ACCOUNT,
-        make_spec(quantity="555.5", payment_methods=("Bank Transfer",)),
+    explicit = adapter.build_update_ad_request(
+        ACCOUNT, make_spec(quantity="555.5", payment_methods=("Bank Transfer",)), ADV_NO
     )
 
     assert derived.json_body["initAmount"] == "21.27"  # floor(1000.00 / 47.00) to 0.01
@@ -896,25 +858,30 @@ def test_create_request_derives_the_quantity_from_max_amount_over_price() -> Non
         ),
     ],
 )
-def test_create_request_refuses_an_unusable_quantity(spec_kwargs: dict[str, Any], message_part: str) -> None:
-    transport = FakeTransport()
+def test_update_refuses_an_unusable_quantity(spec_kwargs: dict[str, Any], message_part: str) -> None:
+    transport = FakeTransport(detail_response())
     adapter = BinanceAdapter(transport, now=FixedClock())
     spec = make_spec(payment_methods=("Bank Transfer",), **spec_kwargs)
 
     with pytest.raises(ConfigError) as excinfo:
-        adapter.build_create_ad_request(ACCOUNT, spec)
+        adapter.build_update_ad_request(ACCOUNT, spec, ADV_NO)
 
     assert message_part in str(excinfo.value)
-    assert len(transport) == 0
+    assert len(transport) == 1  # only the detail; the update is never built
 
 
-def test_create_request_rejects_an_unknown_side() -> None:
-    adapter = BinanceAdapter(FakeTransport(), now=FixedClock())
+@pytest.mark.parametrize("side", ["sell", "SELL", "both"])
+def test_update_refuses_anything_but_a_buy_ad_before_any_request(side: str) -> None:
+    transport = FakeTransport()
+    adapter = BinanceAdapter(transport, now=FixedClock())
 
     with pytest.raises(ConfigError) as excinfo:
-        adapter.build_create_ad_request(ACCOUNT, make_spec(side="both"))
+        adapter.build_update_ad_request(ACCOUNT, make_spec(side=side), ADV_NO)
+    with pytest.raises(ConfigError):
+        adapter.build_update_ad_request(ACCOUNT, make_spec(side=side, active=False), ADV_NO)
 
-    assert str(excinfo.value) == "binance: unsupported side 'both'"
+    assert str(excinfo.value) == f"binance: only buy advertisements are handled, not {side!r}"
+    assert len(transport) == 0
 
 
 # --------------------------------------------------------------------------------------
@@ -958,10 +925,10 @@ def test_update_of_an_active_spec_fetches_the_detail_and_posts_the_full_object()
     assert body["payTimeLimit"] == 15
     # the read shape cannot be echoed back (live: 83664 "no payment method yet"),
     # so the blueprint's methods are resolved into the write shape
-    assert_trade_methods(request, [{"payId": 1, "payType": "BANK"}])
+    assert_trade_methods(request, [{"identifier": "BANK"}])
     # The fields this adapter changes.
     assert body["advNo"] == "13928301035093368832"
-    assert body["tradeType"] == "SELL"  # the venue's own spelling, not 1/0
+    assert body["tradeType"] == "BUY"  # the venue's own spelling, not 1/0
     assert body["priceType"] == 1
     assert body["price"] == "47.00"
     assert body["initAmount"] == "1234.5"
@@ -973,9 +940,7 @@ def test_update_of_an_active_spec_fetches_the_detail_and_posts_the_full_object()
 
 def test_update_normalizes_the_buy_read_shape_to_the_write_enum() -> None:
     detail = dict(AD_DETAIL_PAYLOAD["data"], tradeType="BUY")
-    transport = FakeTransport(
-        json_response({"code": "000000", "data": detail}), json_response(PAY_METHODS_PAYLOAD)
-    )
+    transport = FakeTransport(json_response({"code": "000000", "data": detail}))
     adapter = BinanceAdapter(transport, now=FixedClock())
 
     request = adapter.build_update_ad_request(
@@ -983,6 +948,63 @@ def test_update_normalizes_the_buy_read_shape_to_the_write_enum() -> None:
     )
 
     assert request.json_body["tradeType"] == "BUY"
+    assert request.json_body["tradeMethods"] == [{"identifier": "BANK"}]
+    assert len(transport) == 1  # a buy ad keeps its methods: no account lookup
+
+
+def test_update_of_a_buy_ad_keeps_methods_the_account_does_not_hold() -> None:
+    methods = [
+        {"identifier": "Wise", "tradeMethodName": "Wise"},
+        {"identifier": "AirTM", "tradeMethodName": "AirTM"},
+        "junk",
+        {"tradeMethodName": "no identifier"},
+    ]
+    detail = dict(AD_DETAIL_PAYLOAD["data"], tradeType="BUY", tradeMethods=methods)
+    adapter = BinanceAdapter(
+        FakeTransport(json_response({"code": "000000", "data": detail})), now=FixedClock()
+    )
+
+    request = adapter.build_update_ad_request(
+        ACCOUNT, make_spec(side="buy", quantity="10"), "13928301035093368832"
+    )
+
+    assert request.json_body["tradeMethods"] == [{"identifier": "Wise"}, {"identifier": "AirTM"}]
+
+
+def test_update_with_a_floating_ratio_keeps_the_ad_floating() -> None:
+    detail = dict(
+        AD_DETAIL_PAYLOAD["data"], priceType=2, price="0.9", priceFloatingRatio="90"
+    )
+    transport = FakeTransport(
+        json_response({"code": "000000", "data": detail}), json_response(PAY_METHODS_PAYLOAD)
+    )
+    adapter = BinanceAdapter(transport, now=FixedClock())
+    spec = make_spec(price="0.91", quantity="10", price_floating_ratio="91")
+
+    body = adapter.build_update_ad_request(ACCOUNT, spec, "13928301035093368832").json_body
+
+    assert body["priceType"] == 2
+    assert body["priceFloatingRatio"] == "91"
+    assert body["price"] == "0.9"  # the venue derives it from the ratio; echoed untouched
+
+
+def test_a_fixed_price_turns_a_floating_ad_fixed_and_drops_its_ratio() -> None:
+    # live Binance#1 PLN ads: floating 97.5 %; echoing the ratio made Binance keep them floating
+    detail = dict(
+        AD_DETAIL_PAYLOAD["data"], priceType=2, price="3.74", priceFloatingRatio="97.5"
+    )
+    transport = FakeTransport(
+        json_response({"code": "000000", "data": detail}), json_response(PAY_METHODS_PAYLOAD)
+    )
+    adapter = BinanceAdapter(transport, now=FixedClock())
+
+    body = adapter.build_update_ad_request(
+        ACCOUNT, make_spec(price="3.21", quantity="10"), "13928301035093368832"
+    ).json_body
+
+    assert body["priceType"] == 1
+    assert body["price"] == "3.21"
+    assert "priceFloatingRatio" not in body
 
 
 def test_update_pins_the_addressed_adv_no_even_when_the_detail_disagrees() -> None:
@@ -1041,26 +1063,28 @@ def test_update_propagates_a_venue_failure_of_the_detail_call() -> None:
 @pytest.mark.parametrize(
     ("data", "expected_entry"),
     [
-        ([{"payId": 1, "tradeMethodName": "Bank Transfer"}], {"payId": 1}),
-        ({"items": [{"payId": 1, "tradeMethodName": "Bank Transfer"}]}, {"payId": 1}),
-        ({"list": [{"payId": 1, "tradeMethodName": "Bank Transfer"}]}, {"payId": 1}),
-        ({"rows": [{"payId": 1, "tradeMethodName": "Bank Transfer"}]}, {"payId": 1}),
-        ({"payMethods": [{"payId": 1, "tradeMethodName": "Bank Transfer"}]}, {"payId": 1}),
+        ([{"payId": 1, "tradeMethodName": "Bank Transfer"}], {"identifier": "1"}),
+        ({"items": [{"payId": 1, "tradeMethodName": "Bank Transfer"}]}, {"identifier": "1"}),
+        ({"list": [{"payId": 1, "tradeMethodName": "Bank Transfer"}]}, {"identifier": "1"}),
+        ({"rows": [{"payId": 1, "tradeMethodName": "Bank Transfer"}]}, {"identifier": "1"}),
+        ({"payMethods": [{"payId": 1, "tradeMethodName": "Bank Transfer"}]}, {"identifier": "1"}),
         # A single record (not wrapped in a list) is accepted too.
-        ({"payId": 1, "tradeMethodName": "Bank Transfer"}, {"payId": 1}),
-        ({"payId": 1, "payMethodName": "Bank Transfer"}, {"payId": 1}),
-        ({"payId": 1, "name": "Bank Transfer"}, {"payId": 1}),
+        ({"payId": 1, "tradeMethodName": "Bank Transfer"}, {"identifier": "1"}),
+        ({"payId": 1, "payMethodName": "Bank Transfer"}, {"identifier": "1"}),
+        ({"payId": 1, "name": "Bank Transfer"}, {"identifier": "1"}),
         # No display name anywhere: the payType (then the payId) becomes the resolvable name.
-        ({"payId": 1, "payType": "BANK"}, {"payId": 1, "payType": "BANK"}),
+        ({"payId": 1, "payType": "BANK"}, {"identifier": "BANK"}),
     ],
 )
 def test_payment_method_payload_shapes_all_resolve_to_one_entry(
     data: Any, expected_entry: dict[str, Any]
 ) -> None:
-    transport = FakeTransport(json_response({"code": "000000", "data": data}))
+    transport = FakeTransport(detail_response(), json_response({"code": "000000", "data": data}))
     adapter = BinanceAdapter(transport, now=FixedClock())
 
-    request = adapter.build_create_ad_request(ACCOUNT, make_spec(payment_methods=("Bank Transfer", "BANK")))
+    request = adapter.build_update_ad_request(
+        ACCOUNT, make_spec(payment_methods=("Bank Transfer", "BANK")), ADV_NO
+    )
 
     assert_trade_methods(request, [expected_entry])
 
@@ -1078,38 +1102,49 @@ def test_payment_method_payload_shapes_all_resolve_to_one_entry(
 def test_payment_method_payload_without_usable_records_is_an_error(
     payload: Any, message_part: str
 ) -> None:
-    transport = FakeTransport(json_response(payload))
+    transport = FakeTransport(detail_response(), json_response(payload))
     adapter = BinanceAdapter(transport, now=FixedClock())
 
     with pytest.raises(ApiError) as excinfo:
-        adapter.build_create_ad_request(ACCOUNT, make_spec(payment_methods=("Bank Transfer",)))
+        adapter.build_update_ad_request(
+            ACCOUNT, make_spec(payment_methods=("Bank Transfer",)), ADV_NO
+        )
 
     assert str(excinfo.value) == message_part
     assert excinfo.value.payload == payload
 
 
 def test_payment_method_lookup_is_cached_per_account_and_fiat_only() -> None:
-    transport = FakeTransport(*[json_response(PAY_METHODS_PAYLOAD)] * 3)
+    pay_methods = json_response(PAY_METHODS_PAYLOAD)
+    transport = FakeTransport(
+        detail_response(), pay_methods,
+        detail_response(),
+        detail_response(), pay_methods,
+        detail_response(), pay_methods,
+    )
     adapter = BinanceAdapter(transport, now=FixedClock())
     spec = make_spec(payment_methods=("Bank Transfer",))
 
-    adapter.build_create_ad_request(ACCOUNT, spec)
-    adapter.build_create_ad_request(ACCOUNT, spec)
-    adapter.build_create_ad_request(OTHER_ACCOUNT, spec)
-    adapter.build_create_ad_request(ACCOUNT, make_spec(pair="PLN/USDT", payment_methods=("Bank Transfer",)))
+    adapter.build_update_ad_request(ACCOUNT, spec, ADV_NO)
+    adapter.build_update_ad_request(ACCOUNT, spec, ADV_NO)
+    adapter.build_update_ad_request(OTHER_ACCOUNT, spec, ADV_NO)
+    adapter.build_update_ad_request(
+        ACCOUNT, make_spec(pair="PLN/USDT", payment_methods=("Bank Transfer",)), ADV_NO
+    )
 
-    assert len(transport) == 3
-    assert transport.urls() == [f"{BINANCE}{PAY_METHODS_PATH}"] * 3
+    assert transport.urls().count(f"{BINANCE}{PAY_METHODS_PATH}") == 3
 
 
 def test_payment_method_cache_lives_on_the_adapter_instance() -> None:
-    transport = FakeTransport(json_response(PAY_METHODS_PAYLOAD), json_response(PAY_METHODS_PAYLOAD))
+    pay_methods = json_response(PAY_METHODS_PAYLOAD)
+    transport = FakeTransport(detail_response(), pay_methods, detail_response(), pay_methods)
     spec = make_spec(payment_methods=("Bank Transfer",))
 
-    BinanceAdapter(transport, now=FixedClock()).build_create_ad_request(ACCOUNT, spec)
-    BinanceAdapter(transport, now=FixedClock()).build_create_ad_request(ACCOUNT, spec)
+    BinanceAdapter(transport, now=FixedClock()).build_update_ad_request(ACCOUNT, spec, ADV_NO)
+    BinanceAdapter(transport, now=FixedClock()).build_update_ad_request(ACCOUNT, spec, ADV_NO)
 
-    assert len(transport) == 2  # no shared/global state and no AdStore involved
+    # no shared/global state and no AdStore involved
+    assert transport.urls().count(f"{BINANCE}{PAY_METHODS_PATH}") == 2
 
 
 # --------------------------------------------------------------------------------------
@@ -1135,7 +1170,6 @@ def test_parse_ad_response_reads_the_shapes_the_venue_documents(data: Any, expec
     assert result.adv_no == expected
     assert result.platform == "binance"
     assert result.price is None
-    assert result.created is False
     assert result.pair == Pair.parse("XXX/XXX")
     assert result.raw == {"code": "000000", "data": data}
 
@@ -1147,26 +1181,6 @@ def test_parse_ad_response_keeps_a_non_object_payload_as_raw() -> None:
     assert result.raw == {"payload": "boom"}
 
 
-def test_parse_ad_result_bridges_the_create_response_into_the_identity_fields() -> None:
-    adapter = make_binance()
-    spec = make_spec(price="47.00")
-
-    result = adapter.parse_ad_result(
-        {"code": "000000", "data": "13928301035093368832"},
-        account=ACCOUNT,
-        pair=UAH_USDT,
-        spec=spec,
-        created=True,
-    )
-
-    assert result.adv_no == "13928301035093368832"
-    assert result.platform == "binance"
-    assert result.account_id == "Binance#1"
-    assert result.pair == UAH_USDT
-    assert result.price == Decimal("47.00")  # the create response echoes no price
-    assert result.created is True
-
-
 def test_parse_ad_result_uses_the_addressed_adv_no_for_an_update_response() -> None:
     adapter = make_binance()
 
@@ -1175,12 +1189,14 @@ def test_parse_ad_result_uses_the_addressed_adv_no_for_an_update_response() -> N
         account=ACCOUNT,
         pair=UAH_USDT,
         spec=make_spec(price="47.10"),
-        created=False,
         adv_no="13928301035093368832",
     )
 
     assert result.adv_no == "13928301035093368832"
-    assert result.price == Decimal("47.10")
+    assert result.platform == "binance"
+    assert result.account_id == "Binance#1"
+    assert result.pair == UAH_USDT
+    assert result.price == Decimal("47.10")  # the update response echoes no price
 
 
 @pytest.mark.parametrize(
@@ -1234,3 +1250,119 @@ def test_send_private_surfaces_a_venue_error_payload() -> None:
 
     assert str(excinfo.value) == "binance reported failure (code=-9000, message='Full ad object required')"
     assert excinfo.value.payload == {"code": -9000, "msg": "Full ad object required"}
+
+
+# -- every own advertisement -----------------------------------------------------------
+OWN_ADS_PAGE = {
+    "code": "000000",
+    "success": True,
+    "total": 3,
+    "data": [
+        {
+            "advNo": "13928301035093368832",
+            "tradeType": "SELL",
+            "asset": "USDT",
+            "fiatUnit": "UAH",
+            "advStatus": 1,
+            "price": 47.1,
+            "surplusAmount": 1500.25,
+            "minSingleTransAmount": 1000,
+            "maxSingleTransAmount": 200000,
+            "tradeMethods": [
+                {"identifier": "Monobank", "tradeMethodName": "Monobank"},
+                {"identifier": "PrivatBank"},
+                "junk",
+            ],
+        },
+        {
+            "advNo": "12929187549246205952",
+            "tradeType": "BUY",
+            "asset": "USDC",
+            "fiatUnit": "PLN",
+            "advStatus": 3,
+            "price": "3.95",
+        },
+        {"advNo": "11", "tradeType": "SELL", "asset": "USDT", "fiatUnit": "UAH", "advStatus": 4},
+        {"advNo": "", "asset": "USDT", "fiatUnit": "UAH"},
+        {"advNo": "12", "asset": "USDT"},
+    ],
+}
+
+
+def test_own_ads_request_is_a_signed_listing_page_without_a_pair() -> None:
+    request = make_binance().build_own_ads_request(ACCOUNT, page=3)
+
+    assert request.url == f"{BINANCE}{ADS_LIST_PATH}"
+    assert request.json_body == {"page": 3, "rows": 20}  # Binance's real per-page maximum
+    assert signed_params(request)["timestamp"] == str(FIXED_NOW_MS)
+
+
+def test_fetch_own_ads_normalizes_every_state_and_pair() -> None:
+    adapter = make_binance(json_response(OWN_ADS_PAGE), json_response({"code": "000000", "data": []}))
+
+    ads = adapter.fetch_own_ads(ACCOUNT)
+
+    assert [(ad.adv_no, ad.pair.symbol, ad.side, ad.status, ad.venue_status) for ad in ads] == [
+        ("13928301035093368832", "UAH/USDT", "sell", "online", "1"),
+        ("12929187549246205952", "PLN/USDC", "buy", "offline", "3"),
+        ("11", "UAH/USDT", "sell", "closed", "4"),
+    ]
+    online = ads[0]
+    assert online.active is True
+    assert online.account_id == "Binance#1"
+    assert online.price == Decimal("47.1")
+    assert online.quantity == Decimal("1500.25")
+    assert (online.min_amount, online.max_amount) == (Decimal("1000"), Decimal("200000"))
+    assert online.payment_methods == ("Monobank", "PrivatBank")
+    assert ads[1].min_amount is None and ads[1].payment_methods == ()
+    assert len(adapter.transport) == 2  # a short first page may be a venue cap: page 2 is read
+
+
+@pytest.mark.parametrize(
+    ("status", "trade_type", "expected"),
+    [(2, "1", ("offline", "sell")), (9, "0", ("unknown", "buy")), (None, "?", ("unknown", ""))],
+)
+def test_parse_own_ad_maps_status_and_side_codes(status: Any, trade_type: str, expected: Any) -> None:
+    row = {"advNo": "1", "asset": "USDT", "fiatUnit": "UAH", "advStatus": status, "tradeType": trade_type}
+
+    ad = make_binance().parse_own_ad(row, ACCOUNT)
+
+    assert (ad.status, ad.side) == expected
+
+
+def test_parse_own_ad_ignores_a_malformed_number() -> None:
+    row = {"advNo": "1", "asset": "USDT", "fiatUnit": "UAH", "price": "n/a"}
+
+    assert make_binance().parse_own_ad(row, ACCOUNT).price is None
+
+
+def test_parse_own_ad_reports_the_total_amount_and_a_floating_ratio() -> None:
+    row = {
+        "advNo": "1", "asset": "USDT", "fiatUnit": "USD", "tradeType": "BUY", "advStatus": 1,
+        "price": "0.9", "priceType": 2, "priceFloatingRatio": "90",
+        "initAmount": 50000, "surplusAmount": "49000",
+    }
+    fixed = dict(row, priceType=1)
+
+    ad = make_binance().parse_own_ad(row, ACCOUNT)
+
+    assert (ad.total_quantity, ad.quantity) == (Decimal("50000"), Decimal("49000"))
+    assert ad.price_floating_ratio == Decimal("90")
+    assert ad.payment_ids == ()
+    assert make_binance().parse_own_ad(fixed, ACCOUNT).price_floating_ratio is None
+
+
+def test_fetch_own_ads_reads_every_page_binance_caps_at_20_rows() -> None:
+    def page(start: int, count: int) -> Any:
+        rows = [
+            {"advNo": str(index), "tradeType": "BUY", "asset": "USDT", "fiatUnit": "UAH", "advStatus": 1}
+            for index in range(start, start + count)
+        ]
+        return json_response({"code": "000000", "data": rows, "total": 42})
+
+    adapter = make_binance(page(0, 20), page(20, 20), page(40, 2))
+
+    ads = adapter.fetch_own_ads(ACCOUNT)
+
+    assert len(ads) == 42  # the live Binance#1 case: 42 ads, 20 per page
+    assert [request.json_body["page"] for request in adapter.transport.requests] == [1, 2, 3]

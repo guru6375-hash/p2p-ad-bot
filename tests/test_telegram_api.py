@@ -14,6 +14,7 @@ import pytest
 from p2pbot import constants
 from p2pbot.errors import TelegramError, TransportError
 from p2pbot.telegram.api import (
+    CallbackQuery,
     Message,
     TelegramAPI,
     TelegramApiError,
@@ -120,6 +121,33 @@ def test_update_from_payload_without_a_message_or_id() -> None:
     update = Update.from_payload({"channel_post": {"text": "hi"}})
     assert update.update_id == 0
     assert update.message is None
+    assert update.callback is None
+
+
+def test_a_button_press_is_parsed_as_a_callback_query() -> None:
+    update = Update.from_payload(
+        {
+            "update_id": 5,
+            "callback_query": {
+                "id": "4382",
+                "from": {"id": 4242},
+                "data": "setrate:uah",
+                "message": {"message_id": 9, "chat": {"id": 42, "type": "private"}, "text": "pick"},
+            },
+        }
+    )
+    assert update.message is None
+    assert update.callback == CallbackQuery(
+        id="4382",
+        from_id=4242,
+        data="setrate:uah",
+        message=Message(message_id=9, chat_id=42, chat_type="private", text="pick"),
+    )
+
+
+def test_an_odd_callback_query_is_tolerated() -> None:
+    callback = Update.from_payload({"callback_query": {"data": 5, "message": "x"}}).callback
+    assert callback == CallbackQuery()
 
 
 # -- constructor -----------------------------------------------------------------------
@@ -170,7 +198,7 @@ def test_get_updates_sends_offset_and_timeout(
     updates = api.get_updates(offset=7, timeout=1)
     assert [update.update_id for update in updates] == [10]
     payload = transport.last_request.json_body
-    assert payload == {"timeout": 1, "allowed_updates": ["message"], "offset": 7}
+    assert payload == {"timeout": 1, "allowed_updates": ["message", "callback_query"], "offset": 7}
     assert transport.last_request.url.endswith("/getUpdates")
 
 
@@ -196,6 +224,42 @@ def test_send_message_sends_one_request_for_a_short_text(
     result = _api(transport).send_message(42, "hello")
     assert result == {"message_id": 3}
     assert transport.last_request.json_body == {"chat_id": 42, "text": "hello"}
+
+
+def test_send_message_puts_the_buttons_under_the_last_chunk(
+    transport: FakeTransport, http_request_bridge
+) -> None:
+    for _ in range(2):
+        transport.push_json({"ok": True, "result": {"message_id": 3}})
+    text = "\n".join(["x" * 100] * 60)  # two chunks
+
+    _api(transport).send_message(42, text, [[("A", "a"), ("B", "b")]])
+
+    first, last = (request.json_body for request in transport.requests)
+    assert "reply_markup" not in first
+    assert last["reply_markup"] == {
+        "inline_keyboard": [[{"text": "A", "callback_data": "a"}, {"text": "B", "callback_data": "b"}]]
+    }
+
+
+def test_answer_callback_query_and_edit_message_text(
+    transport: FakeTransport, http_request_bridge
+) -> None:
+    transport.push_json({"ok": True, "result": True})
+    transport.push_json({"ok": True, "result": True})
+    transport.push_json({"ok": True, "result": True})
+    api = _api(transport)
+
+    assert api.answer_callback_query("4382") is True
+    assert api.answer_callback_query("4383", "done") is True
+    assert api.edit_message_text(42, 9, "picked") is True
+
+    calls = [(str(r.url).rsplit("/", 1)[-1], r.json_body) for r in transport.requests]
+    assert calls == [
+        ("answerCallbackQuery", {"callback_query_id": "4382"}),
+        ("answerCallbackQuery", {"callback_query_id": "4383", "text": "done"}),
+        ("editMessageText", {"chat_id": 42, "message_id": 9, "text": "picked"}),
+    ]
 
 
 def test_send_message_splits_a_long_text_into_several_calls(

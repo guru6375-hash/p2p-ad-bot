@@ -2,8 +2,8 @@
 
 Every enabled pair plan of the blueprint is priced per platform following SPEC 7:
 
-1. the resolved source (``base_rate``, ``base_rate_minus_spread``, ``market_middle`` or
-   ``copy:<Platform>``) produces a reference price;
+1. the resolved source (``base_rate``, ``market_middle`` or ``copy:<Platform>``) produces a
+   reference price;
 2. ``plan.price_offset`` is added and the price is quantized to the fiat tick with
    ``ROUND_HALF_UP`` (:func:`quantize_price`);
 3. the stored **cap wins over everything**: a price above it is clamped, flagged
@@ -32,7 +32,7 @@ from collections.abc import Mapping
 from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal
 from typing import TYPE_CHECKING, Any
 
-from .constants import DEFAULT_PRICE_TICK, PLATFORMS, PRICE_TICK, UAH_SPREAD
+from .constants import DEFAULT_PRICE_TICK, PLATFORMS, PRICE_TICK
 from .errors import (
     ConfigError,
     EngineError,
@@ -54,8 +54,6 @@ _log = logging.getLogger(__name__)
 
 #: Price from the owner's stored ``base_rate`` for the pair itself.
 SOURCE_BASE_RATE = "base_rate"
-#: Price from the linked anchor pair's ``base_rate`` minus the hardcoded ``UAH_SPREAD``.
-SOURCE_BASE_RATE_MINUS_SPREAD = "base_rate_minus_spread"
 #: Price from the filtered middle of the venue's competitor prices.
 SOURCE_MARKET_MIDDLE = "market_middle"
 #: Price copied from another platform's price computed in the same cycle.
@@ -252,25 +250,14 @@ class RateEngine:
     ) -> tuple[Decimal, Decimal, bool]:
         """Resolve ``source`` into ``(reference price, base, inherited cap flag)``.
 
-        ``base`` is the anchoring value the source derived the price from: the stored
-        ``base_rate`` (of the pair, or of the linked anchor pair for the spread source),
-        the venue's middle price, or the already-computed price a ``copy:`` mirrors.
+        ``base`` is the anchoring value the source derived the price from: the pair's
+        stored ``base_rate``, the venue's middle price, or the already-computed price a
+        ``copy:`` mirrors.
         """
         lowered = source.strip().lower()
         if lowered == SOURCE_BASE_RATE:
             base = self._require_base(pair, f"needed by platform {platform}")
             return base, base, False
-        if lowered == SOURCE_BASE_RATE_MINUS_SPREAD:
-            linked = _linked_pair(plan, pair)
-            base = self._require_base(
-                linked, f"linked pair of {pair.symbol}, needed by platform {platform}"
-            )
-            spread = UAH_SPREAD.get(platform)
-            if spread is None:
-                raise PriceError(
-                    f"no hardcoded UAH spread for platform {platform!r} (pair {pair.symbol})"
-                )
-            return base - spread, base, False
         if lowered == SOURCE_MARKET_MIDDLE:
             if self.market is None:
                 raise MissingMarketDataError(
@@ -328,15 +315,6 @@ def _platform_rank(platform: str) -> tuple[int, str]:
         return (PLATFORMS.index(platform), platform)
     except ValueError:
         return (len(PLATFORMS), platform)
-
-
-def _linked_pair(plan: PairPlan, pair: Pair) -> Pair:
-    linked = getattr(plan, "linked_to", None)
-    if linked is None:
-        raise MissingRateError(
-            f"pair {pair.symbol} uses base_rate_minus_spread but has no linked anchor pair"
-        )
-    return Pair.parse(linked)
 
 
 def _offset_of(plan: PairPlan) -> Decimal:

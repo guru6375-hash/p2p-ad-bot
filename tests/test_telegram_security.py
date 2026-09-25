@@ -8,7 +8,7 @@ import pytest
 
 from p2pbot import constants
 from p2pbot.telegram import security
-from p2pbot.telegram.api import Message, Update
+from p2pbot.telegram.api import CallbackQuery, Message, Update
 from p2pbot.telegram.security import (
     RATE_LIMIT_REPLY,
     AccessController,
@@ -47,6 +47,44 @@ def _update(
         ),
         raw={},
     )
+
+
+def _press(*, from_id: int | None = OWNER, chat_type: str = "private") -> Update:
+    return Update(
+        update_id=2,
+        callback=CallbackQuery(
+            id="cb",
+            from_id=from_id,
+            data="setrate:uah",
+            message=Message(message_id=5, chat_id=42, chat_type=chat_type, from_id=1),
+        ),
+    )
+
+
+# -- inline-button presses -------------------------------------------------------------
+def test_a_press_by_the_owner_in_a_private_chat_is_allowed() -> None:
+    access = AccessController(OWNER)
+    assert is_owner(_press(), OWNER) is True
+    assert access.authorize(_press()) == Decision(allow=True, reason="allow", silent=False)
+
+
+def test_a_press_is_judged_by_who_pressed_not_who_sent_the_message() -> None:
+    access = AccessController(OWNER)
+    assert access.authorize(_press(from_id=999)).reason == "not-owner"
+    assert access.authorize(_press(from_id=None)).reason == "not-owner"
+    assert access.authorize(_press(chat_type="group")).reason == "non-private-chat"
+
+
+def test_presses_count_towards_the_rate_limit() -> None:
+    access = AccessController(OWNER, limiter=RateLimiter(max_messages=1, window_seconds=60))
+    assert access.authorize(_press()).allow is True
+    assert access.authorize(_press()).reason == "rate-limit"
+
+
+def test_audit_names_the_presser(caplog: pytest.LogCaptureFixture) -> None:
+    with caplog.at_level(logging.WARNING):
+        audit(logging.getLogger("t"), _press(from_id=999), Decision(False, "not-owner", True))
+    assert "from=999" in caplog.text
 
 
 # -- owner gate ------------------------------------------------------------------------

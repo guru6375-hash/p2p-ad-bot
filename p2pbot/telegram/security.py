@@ -3,7 +3,8 @@
 Policy (SPEC 11.1), enforced before any command is dispatched and before any Telegram
 call is made:
 
-* only ``TELEGRAM_OWNER_ID`` may interact; anyone else is dropped **without a reply**
+* only ``TELEGRAM_OWNER_ID`` may interact (messages and inline-button presses alike);
+  anyone else is dropped **without a reply**
   and written to the audit log;
 * non-private chats (group/supergroup/channel) are refused even for the owner;
 * any message carrying an upload is refused - the bot never accepts files, so rejection
@@ -56,20 +57,29 @@ def is_owner(update: "Update", owner_id: int | None) -> bool:
     """True only when the update was sent by ``owner_id``.
 
     A missing configuration (``owner_id is None``) denies everyone, and an update with no
-    sender (channel posts, service updates) is never the owner.
+    sender (channel posts, service updates) is never the owner. A button press counts as
+    sent by whoever pressed it.
     """
     if owner_id is None:
         return False
-    message = getattr(update, "message", None)
-    if message is None:
-        return False
-    sender = getattr(message, "from_id", None)
+    sender = _sender(update)
     if sender is None:
         return False
     try:
         return int(sender) == int(owner_id)
     except (TypeError, ValueError):
         return False
+
+
+def _sender(update: "Update") -> Any:
+    """Who sent the message, or pressed the button, of ``update`` (``None`` when unknown)."""
+    message = getattr(update, "message", None)
+    if message is not None:
+        return getattr(message, "from_id", None)
+    callback = getattr(update, "callback", None)
+    if callback is not None:
+        return getattr(callback, "from_id", None)
+    return None
 
 
 def has_attachments(message: "Message | None") -> bool:
@@ -126,16 +136,19 @@ class AccessController:
     def authorize(self, update: "Update") -> Decision:
         """Return the decision for ``update``; ``reason`` is a stable short string."""
         message = getattr(update, "message", None)
-        if message is None:
+        callback = getattr(update, "callback", None)
+        if message is None and callback is None:
             return Decision(allow=False, reason="no-message", silent=True)
         if not is_owner(update, self.owner_id):
             return Decision(allow=False, reason="not-owner", silent=True)
-        chat_type = str(getattr(message, "chat_type", "") or "").lower()
+        # a button press is judged by the chat of the message that carries the button
+        chat = message if message is not None else getattr(callback, "message", None)
+        chat_type = str(getattr(chat, "chat_type", "") or "").lower()
         if chat_type != "private":
             return Decision(allow=False, reason="non-private-chat", silent=True)
-        if has_attachments(message):
+        if message is not None and has_attachments(message):
             return Decision(allow=False, reason="attachment", silent=True)
-        sender = int(getattr(message, "from_id"))  # is_owner() above proved it is an integer
+        sender = int(_sender(update))  # is_owner() above proved it is an integer
         if not self.limiter.check(sender):
             return Decision(allow=False, reason="rate-limit", silent=False)
         return Decision(allow=True, reason="allow", silent=False)
@@ -145,8 +158,7 @@ def audit(logger: logging.Logger, update: "Update", decision: Decision) -> None:
     """Write one audit line for a refused update; never logs contents or secrets."""
     if decision.allow:
         return
-    message = getattr(update, "message", None)
-    sender: Any = getattr(message, "from_id", None) if message is not None else None
+    sender: Any = _sender(update)
     logger.warning(
         "audit: rejected %s update=%s from=%s",
         decision.reason,

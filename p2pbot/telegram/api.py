@@ -1,7 +1,8 @@
 """Stdlib Telegram Bot API client for the owner-only bot.
 
 Every call is a JSON ``POST {base_url}/bot{token}/{method}``, the shape the Bot API
-accepts for ``getMe``, ``getUpdates``, ``sendMessage`` and ``setMyCommands``.
+accepts for ``getMe``, ``getUpdates``, ``sendMessage``, ``editMessageText``,
+``answerCallbackQuery`` and ``setMyCommands``.
 
 Design notes
 ------------
@@ -15,6 +16,8 @@ Design notes
   the ``/bot<token>/`` path segment never leaves this module.
 * Text longer than ``constants.TELEGRAM_MAX_MESSAGE_LENGTH`` is split on line boundaries
   and sent as several ``sendMessage`` calls.
+* Inline buttons are ``(label, callback_data)`` rows; a press arrives as a
+  :class:`CallbackQuery` update and must be acknowledged with ``answerCallbackQuery``.
 * Uploads are only ever *detected* (payload key names). There is deliberately no
   ``getFile``/download counterpart in this client.
 """
@@ -35,6 +38,8 @@ if TYPE_CHECKING:  # pragma: no cover - typing only, keeps the runtime import gr
     from ..exchanges.base import Transport
 
 __all__ = [
+    "Buttons",
+    "CallbackQuery",
     "Message",
     "TelegramAPI",
     "TelegramApiError",
@@ -44,6 +49,9 @@ __all__ = [
 ]
 
 _LOGGER = logging.getLogger(__name__)
+
+#: Inline keyboard: rows of ``(label, callback_data)`` buttons.
+Buttons = Sequence[Sequence[tuple[str, str]]]
 
 
 class TelegramApiError(TelegramError):
@@ -123,12 +131,39 @@ class Message:
 
 
 @dataclass(frozen=True)
+class CallbackQuery:
+    """A press of an inline button: who pressed it, where, and its ``callback_data``."""
+
+    id: str = ""
+    from_id: int | None = None
+    data: str = ""
+    #: the message that carries the button (its chat is where the reply goes)
+    message: Message | None = None
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, Any]) -> "CallbackQuery":
+        """Build a callback query from a raw payload, tolerating missing/odd fields."""
+        data: Mapping[str, Any] = payload if isinstance(payload, Mapping) else {}
+        sender = data.get("from")
+        sender_data: Mapping[str, Any] = sender if isinstance(sender, Mapping) else {}
+        raw_message = data.get("message")
+        value = data.get("data")
+        return cls(
+            id=str(data.get("id") or ""),
+            from_id=_int_or_none(sender_data.get("id")),
+            data=value if isinstance(value, str) else "",
+            message=Message.from_payload(raw_message) if isinstance(raw_message, Mapping) else None,
+        )
+
+
+@dataclass(frozen=True)
 class Update:
     """One long-polling update; ``raw`` keeps the untouched payload for diagnostics."""
 
     update_id: int = 0
     message: Message | None = None
     raw: Mapping[str, Any] = field(default_factory=dict)
+    callback: CallbackQuery | None = None
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> "Update":
@@ -136,8 +171,27 @@ class Update:
         data: Mapping[str, Any] = payload if isinstance(payload, Mapping) else {}
         raw_message = data.get("message")
         message = Message.from_payload(raw_message) if isinstance(raw_message, Mapping) else None
+        raw_callback = data.get("callback_query")
+        callback = (
+            CallbackQuery.from_payload(raw_callback) if isinstance(raw_callback, Mapping) else None
+        )
         update_id = _int_or_none(data.get("update_id"))
-        return cls(update_id=0 if update_id is None else update_id, message=message, raw=data)
+        return cls(
+            update_id=0 if update_id is None else update_id,
+            message=message,
+            raw=data,
+            callback=callback,
+        )
+
+
+def inline_keyboard(buttons: Buttons) -> dict[str, Any]:
+    """``reply_markup`` for an inline keyboard of ``(label, callback_data)`` rows."""
+    return {
+        "inline_keyboard": [
+            [{"text": str(label), "callback_data": str(data)} for label, data in row]
+            for row in buttons
+        ]
+    }
 
 
 def split_message(text: str, limit: int = constants.TELEGRAM_MAX_MESSAGE_LENGTH) -> list[str]:
@@ -298,7 +352,10 @@ class TelegramAPI:
     def get_updates(self, offset: int | None = None, timeout: int | None = None) -> tuple[Update, ...]:
         """``getUpdates``: long poll for new updates, skipping everything below ``offset``."""
         wait = self.poll_timeout if timeout is None else int(timeout)
-        payload: dict[str, Any] = {"timeout": wait, "allowed_updates": ["message"]}
+        payload: dict[str, Any] = {
+            "timeout": wait,
+            "allowed_updates": ["message", "callback_query"],
+        }
         if offset is not None:
             payload["offset"] = int(offset)
         result = self._call("getUpdates", payload, max(self.timeout, wait + 10.0))
@@ -306,13 +363,40 @@ class TelegramAPI:
             return ()
         return tuple(Update.from_payload(item) for item in result if isinstance(item, Mapping))
 
-    def send_message(self, chat_id: int, text: str) -> dict[str, Any]:
-        """``sendMessage``: send ``text``, split on line boundaries when it is too long."""
+    def send_message(
+        self, chat_id: int, text: str, buttons: Buttons | None = None
+    ) -> dict[str, Any]:
+        """``sendMessage``: send ``text``, split on line boundaries when it is too long.
+
+        ``buttons`` (an inline keyboard) go under the last chunk.
+        """
         result: dict[str, Any] = {}
-        for chunk in split_message(text, constants.TELEGRAM_MAX_MESSAGE_LENGTH):
-            raw = self._call("sendMessage", {"chat_id": int(chat_id), "text": chunk}, self.timeout)
+        chunks = split_message(text, constants.TELEGRAM_MAX_MESSAGE_LENGTH)
+        for index, chunk in enumerate(chunks):
+            payload: dict[str, Any] = {"chat_id": int(chat_id), "text": chunk}
+            if buttons and index == len(chunks) - 1:
+                payload["reply_markup"] = inline_keyboard(buttons)
+            raw = self._call("sendMessage", payload, self.timeout)
             result = dict(raw) if isinstance(raw, Mapping) else {}
         return result
+
+    def edit_message_text(self, chat_id: int, message_id: int, text: str) -> bool:
+        """``editMessageText``: replace a sent message's text (this also drops its buttons)."""
+        payload = {
+            "chat_id": int(chat_id),
+            "message_id": int(message_id),
+            "text": text[: constants.TELEGRAM_MAX_MESSAGE_LENGTH],
+        }
+        self._call("editMessageText", payload, self.timeout)
+        return True
+
+    def answer_callback_query(self, callback_id: str, text: str | None = None) -> bool:
+        """``answerCallbackQuery``: stop the pressed button's loading spinner."""
+        payload: dict[str, Any] = {"callback_query_id": str(callback_id)}
+        if text:
+            payload["text"] = text
+        self._call("answerCallbackQuery", payload, self.timeout)
+        return True
 
     def set_my_commands(self, commands: Sequence[tuple[str, str]]) -> bool:
         """``setMyCommands``: publish the command list Telegram shows in the client."""

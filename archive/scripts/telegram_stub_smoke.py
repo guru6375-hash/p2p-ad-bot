@@ -8,7 +8,7 @@ The harness starts a ``http.server.ThreadingHTTPServer`` that implements
 ``/bot<token>/getMe``, ``/getUpdates``, ``/sendMessage`` and ``/setMyCommands``, records
 every ``sendMessage`` body, and feeds a scripted update sequence (a foreign user with a
 document, a foreign ``/setbase``, then the owner's commands, the owner's document, and
-``/version``). It then drives the *real* :class:`p2pbot.telegram.bot.BotRunner` poll loop
+``/help``). It then drives the *real* :class:`p2pbot.telegram.bot.BotRunner` poll loop
 - one poll iteration per scripted update - against a hand-written stub façade that
 implements exactly the SPEC 11.5 contract, and prints the transcript.
 
@@ -27,11 +27,12 @@ import json
 import logging
 import sys
 import threading
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Mapping, Sequence
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -41,7 +42,6 @@ if str(ROOT) not in sys.path:
 from p2pbot import constants  # noqa: E402
 from p2pbot.errors import (  # noqa: E402
     ConfigError,
-    MissingCapError,
     MissingRateError,
     TelegramError,
     TransportError,
@@ -205,29 +205,17 @@ SCRIPT: tuple[tuple[dict[str, Any], str, bool], ...] = (
     (_message(3, OWNER_ID, text="/setbase UAH/USDT 47.00"), "owner", False),
     (_message(4, OWNER_ID, text="/setcap UAH/USDT 46.50"), "owner", False),
     (_message(5, OWNER_ID, text="/rates"), "owner", False),
-    (_message(6, OWNER_ID, text="/status"), "owner", False),
+    (_message(6, OWNER_ID, text="/scenarios"), "owner", False),
     (
         _message(7, OWNER_ID, attachments=(("document", {"file_id": "BQ-OWNER", "file_name": "rates.csv"}),)),
         "owner",
         True,
     ),
-    (_message(8, OWNER_ID, text="/version"), "owner", False),
+    (_message(8, OWNER_ID, text="/help"), "owner", False),
 )
 
 
 # ------------------------------------------------------------------- stub façade (§11.5)
-
-
-@dataclass(frozen=True)
-class PublishResult:
-    account_id: str
-    platform: str
-    pair: str
-    status: str
-    price: Decimal | None = None
-    adv_no: str | None = None
-    error: str | None = None
-    dry_run: bool = False
 
 
 @dataclass(frozen=True)
@@ -263,7 +251,6 @@ class StatusSnapshot:
     prices: tuple[ComputedAd, ...]
     market: tuple[MarketRow, ...]
     jobs: tuple[JobRow, ...]
-    last_publish: tuple[PublishResult, ...]
     engine_error: str | None = None
     engine_problems: tuple[str, ...] = ()
 
@@ -446,21 +433,10 @@ class StubServices:
         )
         self.scheduler = StubScheduler(clock)
         self.scenarios = StubScenarios()
-        self.publish_calls: list[bool] = []
-        #: Engine-skipped (pair, platform) problems, surfaced as ``engine_problems`` /
-        #: ``last_problems`` exactly like the real façade does.
+        #: Engine-skipped (pair, platform) problems, surfaced as ``engine_problems``
+        #: exactly like the real façade does.
         self.problems: tuple[str, ...] = ()
-        self.last_problems: tuple[str, ...] = ()
-        self._last_publish: tuple[PublishResult, ...] = (
-            PublishResult(
-                account_id="Binance#1",
-                platform="binance",
-                pair=PAIR.symbol,
-                status="created",
-                price=Decimal("46.50"),
-                adv_no="9001",
-            ),
-        )
+        self.setrate_calls: list[tuple[Decimal, bool]] = []
 
     # ----- façade methods -----------------------------------------------------------
 
@@ -484,44 +460,19 @@ class StubServices:
             for platform in constants.PLATFORMS
         )
 
-    def refresh_prices(self, *, dry_run: bool = False) -> tuple[PublishResult, ...]:
-        self.publish_calls.append(dry_run)
-        if self.rates.base(PAIR) is None:
-            # Mirrors the real façade: a missing rate is a hard EngineError, not a no-op.
-            raise MissingRateError(f"no base_rate stored for {PAIR.symbol}")
-        if self.rates.cap(PAIR) is None:
-            raise MissingCapError(f"no cap_rate stored for {PAIR.symbol}")
+    def set_uah_rate(self, rate: Decimal, *, dry_run: bool = False) -> Any:
+        """``/setrate``: USDT ads at the rate, USDC ads at rate - STEP (0.25/0.01/0.01)."""
+        self.setrate_calls.append((rate, dry_run))
+        status = "dry_run" if dry_run else "updated"
         results = tuple(
-            PublishResult(
-                account_id=ad.accounts[0],
-                platform=ad.platform,
-                pair=ad.pair.symbol,
-                status="dry_run" if dry_run else "created",
-                price=ad.price,
-                adv_no=None if dry_run else "9001",
-                dry_run=dry_run,
+            SimpleNamespace(
+                account_id=f"{platform.capitalize()}#1", pair=pair, status=status,
+                price=price, adv_no="9001", error=None,
             )
-            for ad in self._prices()
+            for platform, step in (("binance", Decimal("0.25")), ("okx", Decimal("0.01")), ("bybit", Decimal("0.01")))
+            for pair, price in (("UAH/USDT", rate), ("UAH/USDC", rate - step))
         )
-        self._last_publish = results
-        self.last_problems = self.problems
-        return results
-
-    def set_active(self, active: bool, pairs: Sequence[str] | None = None) -> tuple[PublishResult, ...]:
-        wanted = {Pair.parse(item).symbol for item in pairs} if pairs else {PAIR.symbol}
-        self.last_problems = self.problems
-        return tuple(
-            PublishResult(
-                account_id=ad.accounts[0],
-                platform=ad.platform,
-                pair=ad.pair.symbol,
-                status="updated" if active else "skipped",
-                price=ad.price,
-                adv_no="9001",
-            )
-            for ad in self._prices()
-            if ad.pair.symbol in wanted
-        )
+        return SimpleNamespace(queued=(), unchanged=(), results=results, problems=())
 
     def run_parser(self, pairs: Sequence[str] | None = None) -> tuple[MarketFetchResult, ...]:
         return (
@@ -534,7 +485,7 @@ class StubServices:
             version=self.version,
             scenario=self.scenarios.active_name(),
             fiat="UAH",
-            strategy="fixed_spread",
+            strategy="market_middle",
             rates=(RateRow(PAIR.symbol, self.rates.base(PAIR), self.rates.cap(PAIR)),),
             prices=self._prices(),
             market=(
@@ -542,7 +493,6 @@ class StubServices:
                 MarketRow("okx", PAIR.symbol, Decimal("47.10"), 4, self.clock() - timedelta(minutes=40)),
             ),
             jobs=(JobRow("parser", self.scheduler.next_run(), None),),
-            last_publish=self._last_publish,
             engine_problems=self.problems,
         )
 
@@ -552,19 +502,6 @@ PROBLEMS = (
     "UAH/USDC okx: MissingMarketDataError: no market middle available for UAH/USDC on okx",
     "UAH/USDC bybit: MissingMarketDataError: copy source UAH/USDC on binance unavailable",
 )
-
-
-class NoPricedAds(StubServices):
-    """Façade whose every entry is skipped by the engine: zero results, two problems."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.rates.set_base(PAIR, Decimal("47.00"))
-        self.rates.set_cap(PAIR, Decimal("46.50"))
-        self.problems = PROBLEMS
-
-    def _prices(self) -> tuple[ComputedAd, ...]:
-        return ()
 
 
 class RecordingAccess(AccessController):
@@ -707,13 +644,12 @@ def main() -> int:
     setbase_text = str(by_id[3]["replies"][0].get("text", ""))
     setcap_text = str(by_id[4]["replies"][0].get("text", ""))
     check(
-        "/setbase with no cap: value stored and the refresh degrades gracefully",
-        setbase_text.startswith("base_rate UAH/USDT = 47.00")
-        and "ads not updated: MissingCapError" in setbase_text,
+        "/setbase stores the value and pushes nothing",
+        setbase_text == "base_rate UAH/USDT = 47.00",
     )
     check(
-        "/setcap states the cap rule and pushes prices immediately",
-        "can never exceed the cap" in setcap_text and "publish: 3 ads" in setcap_text,
+        "/setcap states the cap rule and pushes nothing",
+        "can never exceed the cap" in setcap_text and "publish" not in setcap_text,
     )
 
     _banner("probe: injected Transport (p2pbot.exchanges.base) instead of urllib")
@@ -742,7 +678,7 @@ def main() -> int:
                     result = True
                 return HttpResponse(status=200, body=json.dumps({"ok": True, "result": result}).encode("utf-8"))
 
-        transport = RecordingTransport([_message(77, OWNER_ID, text="/version")])
+        transport = RecordingTransport([_message(77, OWNER_ID, text="/help")])
         probe_api = TelegramAPI("http://127.0.0.1:1", TOKEN, transport=transport)
         probe_runner = BotRunner(
             StubServices(),
@@ -792,15 +728,10 @@ def main() -> int:
         "/rates",
         "/scenarios",
         "/scenario uah",
-        "/parse",
-        "/publish --dry",
-        "/pause UAH/USDT",
-        "/resume",
         "/setbase UAH/USDT",
         "/setbase UAH/USDT abc",
         "/setbase nonsense 47.00",
         "/setcap UAH/USDT 46.50",
-        "/publish --bogus",
         "/nope",
         "hello there",
     ):
@@ -808,10 +739,18 @@ def main() -> int:
         head = reply.split("\n")[0]
         extra = "" if reply.count("\n") == 0 else f" (+{reply.count(chr(10))} more lines)"
         print(f"{command_text!r} -> {head}{extra}")
-    print("/status ->")
-    _print_text("", dispatch("/status"), indent="  ")
+    print("/rates ->")
+    _print_text("", dispatch("/rates"), indent="  ")
 
-    check("/help lists the commands", "/setbase" in dispatch("/help") and "/publish" in dispatch("/help"))
+    check("/help lists the commands", "/setbase" in dispatch("/help") and "/rates" in dispatch("/help"))
+    removed = ("/publish", "/pause", "/resume", "/parse", "/status", "/version")
+    check(
+        "removed commands are gone from /help and answer with the help hint",
+        not any(name in dispatch("/help") for name in removed)
+        and all(
+            dispatch(name) == "Unknown command. Send /help for the command list." for name in removed
+        ),
+    )
     check("/setbase malformed (arg count) -> usage", dispatch("/setbase UAH/USDT") == "Usage: /setbase <PAIR> <RATE>")
     check("/setbase malformed (rate) -> usage", dispatch("/setbase UAH/USDT abc") == "Usage: /setbase <PAIR> <RATE>")
     check("/setbase malformed (pair) -> usage", dispatch("/setbase nonsense 47.00") == "Usage: /setbase <PAIR> <RATE>")
@@ -819,21 +758,13 @@ def main() -> int:
         "/setcap states the cap can never be exceeded",
         "can never exceed the cap" in dispatch("/setcap UAH/USDT 46.50"),
     )
-    check(
-        "/publish --dry maps to refresh_prices(dry_run=True)",
-        True in surface_services.publish_calls and "[dry-run]" in dispatch("/publish --dry"),
-    )
-    check("/publish --bogus -> usage", dispatch("/publish --bogus") == "Usage: /publish [--dry]")
-    check("/parse renders per-platform rows incl. errors", "error=TransportError" in dispatch("/parse"))
-    check("/pause and /resume reach set_active", dispatch("/pause").startswith("pause") and dispatch("/resume").startswith("resume"))
     check("/scenario unknown -> ConfigError text", dispatch("/scenario nope").startswith("ConfigError: unknown scenario"))
     check(
         "unknown command and free text -> help hint",
         dispatch("/nope") == dispatch("hello there") == "Unknown command. Send /help for the command list.",
     )
-    check("/status renders scenario, rates, prices, market, jobs and last publish", all(
-        marker in dispatch("/status")
-        for marker in ("scenario: uah", "rates:", "prices:", "market:", "jobs:", "last publish:", "[clamped]")
+    check("/rates renders the rates and the computed prices", all(
+        marker in dispatch("/rates") for marker in ("rates:", "prices:", "[clamped]")
     ))
 
     failing_services = StubServices()
@@ -843,7 +774,7 @@ def main() -> int:
 
     failing_services.snapshot = _boom  # type: ignore[method-assign]
     failure_reply = Dispatcher(failing_services, logger=logger).dispatch(
-        Update.from_payload(_message(701, OWNER_ID, text="/status"))
+        Update.from_payload(_message(701, OWNER_ID, text="/rates"))
     )
     assert failure_reply is not None
     print(f"façade fault  -> {failure_reply.text}")
@@ -852,7 +783,7 @@ def main() -> int:
         failure_reply.text == "MissingRateError: no base_rate for UAH/USDT",
     )
 
-    _banner("verification 2: a rate change pushes prices immediately (stub façade)")
+    _banner("verification 2: a rate change stores the rate and pushes nothing")
     rate_services = StubServices()
     rate_dispatcher = Dispatcher(rate_services, logger=logger)
 
@@ -862,56 +793,34 @@ def main() -> int:
         )
         return "" if result is None else result.text
 
-    print("no cap stored yet: /setbase UAH/USDT 47.00 ->")
-    no_cap_reply = rate_dispatch("/setbase UAH/USDT 47.00", 801)
-    _print_text("", no_cap_reply, indent="  ")
-    check(
-        "no cap: base rate stored, refresh degrades gracefully",
-        rate_services.rates.base(PAIR) == Decimal("47.00")
-        and "ads not updated: MissingCapError" in no_cap_reply,
-    )
-
-    print("/setcap UAH/USDT 46.50 ->")
+    base_reply = rate_dispatch("/setbase UAH/USDT 47.00", 801)
     cap_reply = rate_dispatch("/setcap UAH/USDT 46.50", 802)
+    _print_text("", base_reply, indent="  ")
     _print_text("", cap_reply, indent="  ")
     check(
-        "cap stored, cap rule stated, prices pushed at once",
-        rate_services.rates.cap(PAIR) == Decimal("46.50")
+        "rates stored, cap rule stated, no advertisement pushed",
+        rate_services.rates.base(PAIR) == Decimal("47.00")
+        and rate_services.rates.cap(PAIR) == Decimal("46.50")
         and "can never exceed the cap" in cap_reply
-        and "publish: 3 ads" in cap_reply,
+        and not hasattr(rate_services, "refresh_prices"),
     )
 
-    print("/setbase UAH/USDT 45.00 (cap now stored) ->")
-    base_reply = rate_dispatch("/setbase UAH/USDT 45.00", 803)
-    _print_text("", base_reply, indent="  ")
+    print("/setrate 47.00 ->")
+    setrate_reply = rate_dispatch("/setrate 47.00", 803)
+    _print_text("", setrate_reply, indent="  ")
     check(
-        "/setbase refreshes too",
-        rate_services.rates.base(PAIR) == Decimal("45.00")
-        and "publish: 3 ads" in base_reply
-        and rate_services.publish_calls[-1] is False,
+        "/setrate reprices USDT at the rate and USDC at rate - STEP on every exchange",
+        rate_services.setrate_calls == [(Decimal("47.00"), False)]
+        and "   UAH/USDC: 46.75" in setrate_reply
+        and "   UAH/USDC: 46.99" in setrate_reply
+        and "   UAH/USDT: 47.00" in setrate_reply
+        and "6 updated · 0 failed · 0 already at rate" in setrate_reply,
     )
-
-    class PartiallyFailing(StubServices):
-        """Façade whose first account fails: the reply must show it and keep the rest."""
-
-        def refresh_prices(self, *, dry_run: bool = False) -> tuple[PublishResult, ...]:
-            results = super().refresh_prices(dry_run=dry_run)
-            broken = replace(results[0], status="error", error="ApiError: rate rejected by venue")
-            return (broken, *results[1:])
-
-    failing_services = PartiallyFailing()
-    failing_dispatcher = Dispatcher(failing_services, logger=logger)
-    failing_dispatcher.dispatch(Update.from_payload(_message(804, OWNER_ID, text="/setbase UAH/USDT 47.00")))
-    failing = failing_dispatcher.dispatch(
-        Update.from_payload(_message(805, OWNER_ID, text="/setcap UAH/USDT 46.50"))
-    )
-    assert failing is not None
-    print("/setcap with one venue failing ->")
-    _print_text("", failing.text, indent="  ")
     check(
-        "per-account publish errors are reported, not swallowed",
-        "publish: 3 ads (1 error)" in failing.text
-        and "ApiError: rate rejected by venue" in failing.text,
+        "/setrate --dry is forwarded; a bad rate shows the usage",
+        "Preview" in rate_dispatch("/setrate 47.00 --dry", 804)
+        and rate_services.setrate_calls[-1] == (Decimal("47.00"), True)
+        and rate_dispatch("/setrate abc", 805) == "Usage: /setrate <RATE> [--dry]",
     )
 
     _banner("verification 3: engine skip problems are rendered")
@@ -926,15 +835,9 @@ def main() -> int:
         )
         return "" if result is None else result.text
 
-    clean_replies = {
-        text: clean_dispatch(text, 900 + index)
-        for index, text in enumerate(("/status", "/rates", "/publish"))
-    }
-    print(f"no problems: /publish -> {clean_replies['/publish'].splitlines()[-1]!r}")
-    check(
-        "no problems -> no 'skipped'/'nothing to push' text anywhere",
-        all("skipped" not in text and "nothing to push" not in text for text in clean_replies.values()),
-    )
+    clean_reply = clean_dispatch("/rates", 900)
+    print(f"no problems: /rates -> {clean_reply.splitlines()[-1]!r}")
+    check("no problems -> no 'skipped' text", "skipped" not in clean_reply)
 
     problem_services = StubServices()
     problem_services.rates.set_base(PAIR, Decimal("47.00"))
@@ -948,38 +851,14 @@ def main() -> int:
         )
         return "" if result is None else result.text
 
-    print("/publish with 3 pushed results and 2 skipped entries ->")
-    publish_reply = problem_dispatch("/publish", 910)
-    _print_text("", publish_reply, indent="  ")
-    publish_lines = publish_reply.split("\n")
-    check(
-        "results line followed by exactly one 'skipped 2:' line",
-        publish_lines[0] == "publish:"
-        and sum(1 for line in publish_lines if line.startswith("  created ")) == 3
-        and sum(1 for line in publish_lines if line.startswith("skipped ")) == 1
-        and publish_lines[-1] == f"skipped 2: {PROBLEMS[0]}",
-    )
-
-    print("/status with the same 2 skipped entries ->")
-    status_reply = problem_dispatch("/status", 911)
-    _print_text("", status_reply, indent="  ")
-    check(
-        "/status appends a 'skipped 2:' block listing both problems",
-        "skipped 2:" in status_reply
-        and f"  {PROBLEMS[0]}" in status_reply
-        and f"  {PROBLEMS[1]}" in status_reply,
-    )
-
     rates_reply = problem_dispatch("/rates", 912)
+    print("/rates with 2 skipped entries ->")
+    _print_text("", rates_reply, indent="  ")
     check(
-        "/rates appends the same block",
-        "skipped 2:" in rates_reply and f"  {PROBLEMS[0]}" in rates_reply,
-    )
-
-    paused_reply = problem_dispatch("/pause", 913)
-    check(
-        "/pause appends the single 'skipped 2:' line too",
-        paused_reply.split("\n")[-1] == f"skipped 2: {PROBLEMS[0]}",
+        "/rates appends a 'skipped 2:' block listing both problems",
+        "skipped 2:" in rates_reply
+        and f"  {PROBLEMS[0]}" in rates_reply
+        and f"  {PROBLEMS[1]}" in rates_reply,
     )
 
     many_services = StubServices()
@@ -1001,18 +880,6 @@ def main() -> int:
         "skipped 12:" in many_reply.text
         and sum(1 for line in many_lines if line.startswith("  UAH/USDC")) == 10
         and many_lines[-1] == "  ... and 2 more",
-    )
-
-    nothing_services = NoPricedAds()
-    nothing_reply = Dispatcher(nothing_services, logger=logger).dispatch(
-        Update.from_payload(_message(915, OWNER_ID, text="/publish"))
-    )
-    assert nothing_reply is not None
-    print("/publish with 0 results and 2 skipped entries ->")
-    _print_text("", nothing_reply.text, indent="  ")
-    check(
-        "zero results + problems -> explicit 'nothing to push' wording",
-        nothing_reply.text == f"publish:\nnothing to push: {PROBLEMS[0]}",
     )
 
     _banner("verification 4: rate limiter (sliding window, 20/60s)")
@@ -1038,7 +905,7 @@ def main() -> int:
     limited_access = AccessController(OWNER_ID, limiter=RateLimiter(20, 60, clock=lambda: 0.0))
     last = None
     for index in range(21):
-        last = limited_access.authorize(Update.from_payload(_message(500 + index, OWNER_ID, text="/status")))
+        last = limited_access.authorize(Update.from_payload(_message(500 + index, OWNER_ID, text="/rates")))
     assert last is not None
     print(
         f"  update #21 -> allow={last.allow} reason={last.reason} silent={last.silent} "
@@ -1047,10 +914,10 @@ def main() -> int:
     check("21st owner update is refused with reason=rate-limit", last.allow is False and last.reason == "rate-limit")
 
     _banner("verification 5: non-private chat refused")
-    group_update = Update.from_payload(_message(900, OWNER_ID, text="/status", chat_type="supergroup"))
+    group_update = Update.from_payload(_message(900, OWNER_ID, text="/rates", chat_type="supergroup"))
     group_decision = AccessController(OWNER_ID).authorize(group_update)
     print(
-        f"owner /status in a supergroup -> allow={group_decision.allow} "
+        f"owner /rates in a supergroup -> allow={group_decision.allow} "
         f"reason={group_decision.reason} silent={group_decision.silent}"
     )
     check(
